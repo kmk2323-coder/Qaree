@@ -11,7 +11,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-import { useState, useRef, useEffect, useCallback } from "react";
+// ── استخدام كائن React العام بدلاً من import ────────────────────────────────
+const { useState, useRef, useEffect, useCallback } = React;
 
 // ── API Key management ────────────────────────────────────────────────────────
 let _apiKey = "";
@@ -421,8 +422,8 @@ body{background:var(--bg);color:var(--t);font-family:'Tajawal',sans-serif;direct
   box-shadow:var(--sh);pointer-events:none;white-space:nowrap}
 `;
 
-// ── App ───────────────────────────────────────────────────────────────────────
-export default function App() {
+// ── App (without export) ───────────────────────────────────────────────────────
+function App() {
   const [view,       setView]       = useState("library");
   const [books,      setBooks]      = useState(BOOKS);
   const [book,       setBook]       = useState(BOOKS[0]);
@@ -1069,8 +1070,9 @@ function Bcard({b, sel, onClick}) {
   );
 }
 
-  const root = ReactDOM.createRoot(document.getElementById('root'));
-  root.render(<App/>);
+// ── Render ────────────────────────────────────────────────────────────────────
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
   </script>
 </body>
 </html>
