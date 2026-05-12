@@ -644,31 +644,123 @@ function App() {
     showT("✓ أُضيف الكتاب إلى مكتبتك");
   };
 
-  // ── PDF Upload (real) ────────────────────────────────────────────────────────
+  // ── OCR via Claude (للصور والـ PDF المسموح) ──────────────────────────────────
+  const ocrViaClaudeBase64 = async (base64, mediaType="image/jpeg") => {
+    const key = getKey();
+    if (!key) throw new Error("NO_KEY");
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method:"POST",
+      headers:{"Content-Type":"application/json","x-api-key":key,
+        "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+      body:JSON.stringify({
+        model:"claude-sonnet-4-20250514", max_tokens:4000,
+        system:"أنت نظام OCR متخصص في العربية. استخرج كل النص المرئي في الصورة بدقة تامة مع الحفاظ على الفقرات والترتيب. أعطِ النص فقط بدون أي تعليق.",
+        messages:[{role:"user",content:[
+          {type:"image",source:{type:"base64",media_type:mediaType,data:base64}},
+          {type:"text",text:"استخرج النص كاملاً."}
+        ]}],
+      }),
+    });
+    if (!res.ok) throw new Error("OCR_API_ERROR");
+    const data = await res.json();
+    return data.content?.[0]?.text || "";
+  };
+
+  // تحويل صفحة PDF إلى صورة base64
+  const pdfPageToBase64 = async (pdfDoc, pageNum) => {
+    const page = await pdfDoc.getPage(pageNum);
+    const viewport = page.getViewport({scale: 2.0});
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext("2d");
+    await page.render({canvasContext:ctx, viewport}).promise;
+    return canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
+  };
+
+  // ── PDF Upload مع OCR تلقائي ──────────────────────────────────────────────
   const handlePDFFile = async (file) => {
     if (!file) return;
     setAddErr("");
     const isPDF = file.type==="application/pdf" || file.name.endsWith(".pdf");
     const isTXT = file.type==="text/plain" || file.name.endsWith(".txt");
+    const isImg = file.type.startsWith("image/");
 
     setLoading(true);
-    setLoadMsg("جارٍ قراءة الملف...");
 
     try {
-      let text="", pages=1, chapters=[];
+      let text="", pages=1, chapters=[], usedOCR=false;
 
-      if (isPDF && window.pdfjsLib) {
-        setLoadMsg("جارٍ استخراج النص من PDF...");
-        const result = await extractPDFText(file);
-        text = result.text;
-        pages = result.pages;
-        chapters = result.chapters.length ? result.chapters : ["الفصل الأول"];
-      } else if (isTXT) {
+      // ── صورة مباشرة → OCR فوراً ──────────────────────────────────────────
+      if (isImg) {
+        if (!hasKey) { setAddErr("يحتاج OCR إلى مفتاح API — أدخله أولاً"); setLoading(false); return; }
+        setLoadMsg("جارٍ استخراج النص من الصورة بالذكاء الاصطناعي...");
+        const reader = new FileReader();
+        const b64 = await new Promise(r=>{ reader.onload=e=>r(e.target.result.split(",")[1]); reader.readAsDataURL(file); });
+        text = await ocrViaClaudeBase64(b64, file.type);
+        pages = 1; chapters = ["النص الكامل"]; usedOCR = true;
+      }
+
+      // ── PDF ───────────────────────────────────────────────────────────────
+      else if (isPDF && window.pdfjsLib) {
+        setLoadMsg("جارٍ قراءة الملف...");
+        const buffer = await file.arrayBuffer();
+        const pdfDoc = await pdfjsLib.getDocument({data: buffer}).promise;
+        pages = pdfDoc.numPages;
+
+        // أولاً: حاول استخراج النص النصي
+        setLoadMsg(`جارٍ استخراج النص — ${pages} صفحة...`);
+        let extractedText = "";
+        const chaptersList = [];
+        for (let i=1; i<=pages; i++) {
+          const page = await pdfDoc.getPage(i);
+          const content = await page.getTextContent();
+          const pt = content.items.map(item=>item.str).join(" ").trim();
+          if (pt) extractedText += pt + "\n\n";
+          if (i===1 || i%20===0) chaptersList.push(`الصفحة ${i}`);
+        }
+
+        const arabicChars = (extractedText.match(/[\u0600-\u06FF]/g)||[]).length;
+        const totalChars = extractedText.replace(/\s/g,"").length;
+
+        // إذا النص فارغ أو أقل من 20% عربي → OCR بالذكاء الاصطناعي
+        if (!extractedText.trim() || (totalChars>0 && arabicChars/totalChars < 0.2)) {
+          if (!hasKey) {
+            setAddErr("هذا الـ PDF يحتوي على صور وليس نصاً — يحتاج مفتاح API لاستخراج النص عبر OCR");
+            setLoading(false); return;
+          }
+          setLoadMsg(`🔍 PDF مصوَّر — جارٍ OCR بالذكاء الاصطناعي (${Math.min(pages,5)} صفحة)...`);
+          const maxPages = Math.min(pages, 5); // حد أقصى 5 صفحات لتوفير التكلفة
+          let ocrText = "";
+          for (let i=1; i<=maxPages; i++) {
+            setLoadMsg(`🔍 OCR: صفحة ${i} من ${maxPages}...`);
+            try {
+              const b64 = await pdfPageToBase64(pdfDoc, i);
+              const pageText = await ocrViaClaudeBase64(b64);
+              ocrText += pageText + "\n\n";
+            } catch(e) { console.warn("OCR page error:", e); }
+          }
+          if (pages > 5) ocrText += `\n\n[ملاحظة: تم OCR أول 5 صفحات من أصل ${pages}]`;
+          text = ocrText.trim();
+          chapters = Array.from({length:Math.min(pages,5)},(_,i)=>`الصفحة ${i+1}`);
+          usedOCR = true;
+        } else {
+          text = extractedText.trim();
+          chapters = chaptersList.length ? chaptersList : ["الفصل الأول"];
+        }
+      }
+
+      // ── TXT ───────────────────────────────────────────────────────────────
+      else if (isTXT) {
+        setLoadMsg("جارٍ قراءة الملف...");
         text = await file.text();
         chapters = ["النص الكامل"];
-        pages = Math.ceil(text.split(/\s+/).length / 300);
-      } else {
-        // Try reading as text anyway
+        pages = Math.ceil(text.split(/\s+/).length/300);
+      }
+
+      // ── أي ملف آخر ───────────────────────────────────────────────────────
+      else {
+        setLoadMsg("جارٍ قراءة الملف...");
         text = await file.text();
         chapters = ["النص الكامل"];
       }
@@ -679,21 +771,24 @@ function App() {
         id: Date.now(),
         title: addTitle || file.name.replace(/\.[^/.]+$/,""),
         author:"—", type:"متنوع", progress:0,
-        color:"#2a2a4a", icon:"📄",
-        chapters, summary:`كتاب مرفوع — ${pages} صفحة`,
+        color: usedOCR ? "#2a3a2a" : "#2a2a4a",
+        icon: isImg ? "📷" : "📄",
+        chapters,
+        summary: `${usedOCR?"📷 مستخرج بـ OCR":"📄 ملف مرفوع"} — ${pages} صفحة`,
         excerpt: text, pages,
       };
       setBooks(b=>[...b,nb]);
       setShowAdd(false); setAddTitle("");
       openBook(nb);
-      showT("✓ تم رفع الكتاب بنجاح");
+      showT(usedOCR ? "✓ تم استخراج النص بالذكاء الاصطناعي" : "✓ تم رفع الكتاب بنجاح");
     } catch(e) {
-      setAddErr("حدث خطأ أثناء قراءة الملف: "+e.message);
+      if (e.message==="NO_KEY") { setAddErr("يحتاج OCR إلى مفتاح API — أدخله من الشريط العلوي"); setShowKey(true); }
+      else setAddErr("حدث خطأ: "+e.message);
     }
     setLoading(false);
   };
 
-  // ── URL Fetch ────────────────────────────────────────────────────────────────
+  // ── URL Fetch مع OCR للمحتوى الضعيف ─────────────────────────────────────────
   const handleURL = async () => {
     if (!urlIn.trim()) return;
     setAddErr("");
@@ -701,22 +796,33 @@ function App() {
     setLoadMsg("جارٍ جلب المحتوى من الرابط...");
     try {
       const text = await fetchURL(urlIn.trim());
-      if (!text || text.length < 100) { setAddErr("لم يتم استخراج محتوى كافٍ من الرابط"); setLoading(false); return; }
-      const nb = {
-        id: Date.now(),
-        title: addTitle || new URL(urlIn).hostname,
-        author:"من الويب", type:"متنوع", progress:0,
-        color:"#1a2a4a", icon:"🌐",
-        chapters:["المحتوى الكامل"],
-        summary:`محتوى مجلوب من: ${urlIn.slice(0,60)}`,
-        excerpt: text, pages: Math.ceil(text.split(/\s+/).length/300),
-      };
-      setBooks(b=>[...b,nb]);
-      setShowAdd(false); setUrlIn(""); setAddTitle("");
-      openBook(nb);
-      showT("✓ تم جلب المحتوى بنجاح");
+      const arabicChars = (text.match(/[\u0600-\u06FF]/g)||[]).length;
+
+      // إذا المحتوى كافٍ → أضفه مباشرة
+      if (text && text.length >= 200 && arabicChars >= 50) {
+        const nb = {
+          id: Date.now(),
+          title: addTitle || (() => { try{ return new URL(urlIn).hostname; }catch{return "محتوى من الويب";} })(),
+          author:"من الويب", type:"متنوع", progress:0,
+          color:"#1a2a4a", icon:"🌐",
+          chapters:["المحتوى الكامل"],
+          summary:`محتوى مجلوب من: ${urlIn.slice(0,60)}`,
+          excerpt: text, pages: Math.ceil(text.split(/\s+/).length/300),
+        };
+        setBooks(b=>[...b,nb]);
+        setShowAdd(false); setUrlIn(""); setAddTitle("");
+        openBook(nb);
+        showT("✓ تم جلب المحتوى بنجاح");
+      }
+      // محتوى غير كافٍ أو لا يحتوي عربي → أخبر المستخدم
+      else if (text && text.length >= 200) {
+        setAddErr("المحتوى المجلوب لا يبدو عربياً أو محتواه غير كافٍ. جرّب نسخ النص يدوياً واستخدام خيار \"لصق نص\".");
+      } else {
+        // الرابط لا يرجع محتوى نصياً — قد يكون صفحة محمية أو محتوى ديناميكي
+        setAddErr("لم يُستخرج محتوى من هذا الرابط.\n\nجرّب:\n• نسخ النص يدوياً → خيار \"لصق نص\"\n• رفع الصفحة كـ PDF → خيار \"PDF\"\n• التأكد أن الرابط عام وغير محمي");
+      }
     } catch(e) {
-      setAddErr("فشل في جلب الرابط. تأكد من صحة الرابط أو جرّب نسخ النص يدوياً.");
+      setAddErr("فشل في جلب الرابط — تأكد من صحته أو جرّب نسخ النص يدوياً.");
     }
     setLoading(false);
   };
@@ -1190,21 +1296,26 @@ function App() {
 
                 {addTab==="pdf"&&(
                   <div className="dzone" ref={pdfRef}
-                    onClick={()=>{ const inp=document.createElement('input'); inp.type='file'; inp.accept='.pdf,.txt,.epub'; inp.onchange=e=>handlePDFFile(e.target.files[0]); inp.click(); }}
+                    onClick={()=>{ const inp=document.createElement('input'); inp.type='file'; inp.accept='.pdf,.txt,image/*'; inp.onchange=e=>handlePDFFile(e.target.files[0]); inp.click(); }}
                     onDragOver={e=>{e.preventDefault();pdfRef.current?.classList.add("drag");}}
                     onDragLeave={()=>pdfRef.current?.classList.remove("drag")}
                     onDrop={e=>{e.preventDefault();pdfRef.current?.classList.remove("drag");handlePDFFile(e.dataTransfer.files[0]);}}>
                     <div style={{fontSize:28,marginBottom:8}}><Ic n="upload" s={28}/></div>
                     <div style={{fontSize:13,color:"var(--t2)",fontWeight:500}}>اسحب الملف هنا أو انقر للاختيار</div>
-                    <div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>PDF · TXT — يُستخرج النص تلقائياً</div>
+                    <div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>
+                      PDF · TXT — يُستخرج النص تلقائياً<br/>
+                      <span style={{color:"var(--a3)"}}>📷 صور JPG/PNG — OCR بالذكاء الاصطناعي</span>
+                    </div>
+                    {!hasKey&&<div style={{fontSize:11,color:"var(--gold)",marginTop:6}}>⚠ OCR الصور يحتاج API Key</div>}
                   </div>
                 )}
 
                 {addTab==="url"&&<>
                   <input className="mi" placeholder="https://..." value={urlIn} onChange={e=>setUrlIn(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleURL()}/>
                   <div className="minfo">
-                    يجلب النص من الرابط مباشرة. يعمل مع معظم المواقع العربية.<br/>
-                    مثال: مقالات ويكيبيديا، الشاملة، المكتبة الوقفية
+                    يجلب النص من الرابط مباشرة.<br/>
+                    ✓ يعمل مع: ويكيبيديا، الشاملة، المكتبة الوقفية، مقالات المواقع العربية<br/>
+                    ✗ لا يعمل مع: المواقع المحمية أو التي تحتاج تسجيل دخول
                   </div>
                   <button className="msub" disabled={!urlIn.trim()} onClick={handleURL}>
                     جلب المحتوى من الرابط
