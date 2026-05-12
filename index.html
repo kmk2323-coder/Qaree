@@ -360,21 +360,24 @@ body{background:var(--bg);color:var(--t);font-family:'Tajawal',sans-serif;direct
 .sloc{font-size:10px;color:var(--t3);margin-bottom:3px}
 
 /* PLAYER */
-.player{grid-column:1/-1;background:var(--bg2);border-top:1px solid var(--bd);display:flex;align-items:center;gap:12px;padding:0 16px}
+.player{grid-column:1/-1;background:var(--bg2);border-top:1px solid var(--bd);display:flex;align-items:center;gap:12px;padding:0 16px;position:relative;z-index:10}
 .pbk{display:flex;align-items:center;gap:9px;width:186px;flex-shrink:0}
 .pcover{width:40px;height:40px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:20px}
 .ptitle{font-size:12px;font-weight:700;color:var(--t);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .pch{font-size:11px;color:var(--t3)}
-.pctrls{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.pctrls{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .ctrl{background:none;border:none;cursor:pointer;color:var(--t2);padding:5px;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:all .12s}
 .ctrl:hover{color:var(--t);background:var(--bd)}
-.pp{width:38px;height:38px;background:var(--a);color:#fff;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
-.pp:hover{background:var(--a2)}
-.pp.spk{background:var(--purple)}
+.pp{width:52px;height:52px;background:var(--a);color:#fff;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;flex-shrink:0;box-shadow:0 0 0 4px rgba(46,168,110,.2)}
+.pp:hover{background:var(--a2);transform:scale(1.05)}
+.pp.spk{background:var(--purple);box-shadow:0 0 0 4px rgba(124,58,237,.25)}
+.pp.spk:hover{background:#6d28d9}
+.pp-label{display:flex;flex-direction:column;align-items:center;gap:3px;flex-shrink:0}
+.pp-label span{font-size:10px;color:var(--t3);font-family:'Tajawal',sans-serif;white-space:nowrap}
 .pright{display:flex;align-items:center;gap:11px;flex:1}
 .tlbl{font-size:11px;color:var(--t3);font-variant-numeric:tabular-nums;white-space:nowrap}
-.ptrack{flex:1;height:4px;background:var(--bd2);border-radius:2px;cursor:pointer}
-.pfill{height:100%;background:var(--a);border-radius:2px;transition:width .1s}
+.ptrack{flex:1;height:5px;background:var(--bd2);border-radius:3px;cursor:pointer}
+.pfill{height:100%;background:var(--a);border-radius:3px;transition:width .1s}
 .ptrack:hover .pfill{background:var(--a3)}
 .spdg{display:flex;align-items:center;gap:4px;flex-shrink:0}
 .spdb{background:var(--bg3);border:1px solid var(--bd);color:var(--t2);padding:4px 8px;border-radius:5px;font-size:12px;cursor:pointer;font-family:'Tajawal',sans-serif;transition:all .12s}
@@ -466,7 +469,7 @@ function App() {
   const [ch,        setCh]        = useState(0);
   const [pageIdx,   setPageIdx]   = useState(0);
   const [filter,    setFilter]    = useState("الكل");
-  const [speed,     setSpeed]     = useState(1.5);
+  const [speed,     setSpeed]     = useState(1);
   const [prog,      setProg]      = useState(0);
   const [showAdd,   setShowAdd]   = useState(false);
   const [addTab,    setAddTab]    = useState("pdf");
@@ -511,7 +514,8 @@ function App() {
   const showT = (msg) => { setToast(msg); setTimeout(()=>setToast(""),2800); };
 
   useEffect(()=>{ if(aiRef.current) aiRef.current.scrollTop=aiRef.current.scrollHeight; },[msgs]);
-  useEffect(()=>{ tts.stop(); setTtsOn(false); setHiIdx(-1); setPageIdx(0); },[book]);
+  // عند تغيير الكتاب: أوقف TTS فقط — لا تُصفِّر الصفحة (startBook تتولى ذلك)
+  useEffect(()=>{ tts.stop(); setTtsOn(false); setHiIdx(-1); },[book]);
 
   // Current page text
   const pages = useMemo(()=>{
@@ -557,8 +561,14 @@ function App() {
   };
 
   const startBook = (b, chIdx, pgIdx, prg) => {
-    setBook(b); setCh(chIdx); setPageIdx(pgIdx); setProg(prg);
-    setView("reader"); setMsgs([]); setResumeDlg(null);
+    // نضبط الكتاب أولاً ثم باقي القيم في نفس الـ render cycle
+    setCh(chIdx);
+    setPageIdx(pgIdx);
+    setProg(prg);
+    setBook(b);
+    setView("reader");
+    setMsgs([]);
+    setResumeDlg(null);
   };
 
   const saveProgress = useCallback((bookId, chIdx, pgIdx, prg) => {
@@ -898,17 +908,6 @@ function App() {
                       {book.author} · الفصل {ch+1} · صفحة {pageIdx+1}/{totalPages}
                     </div>
                   </div>
-                  <div style={{display:"flex",gap:6}}>
-                    <button onClick={doTTS} style={{
-                      display:"flex",alignItems:"center",gap:5,padding:"6px 12px",fontSize:12,
-                      background:ttsOn?"rgba(124,58,237,.18)":"rgba(46,168,110,.1)",
-                      border:`1px solid ${ttsOn?"var(--purple)":"var(--a)"}`,borderRadius:8,
-                      cursor:"pointer",color:ttsOn?"#a78bfa":"var(--a3)",fontFamily:"'Tajawal',sans-serif"}}>
-                      <Ic n={ttsOn?"pause":"voice"} s={13}/>
-                      {ttsOn?"إيقاف مؤقت":"استمع"}
-                    </button>
-                    {ttsOn&&<button onClick={stopTTS} style={{padding:"6px 11px",fontSize:12,background:"rgba(224,92,92,.1)",border:"1px solid var(--red)",borderRadius:8,cursor:"pointer",color:"var(--red)",fontFamily:"'Tajawal',sans-serif"}}>■</button>}
-                  </div>
                 </div>
 
                 {/* Search */}
@@ -1129,15 +1128,28 @@ function App() {
               <div className="pch">{book?`ص ${pageIdx+1}/${totalPages}`:"—"}</div>
             </div>
           </div>
+
           <div className="pctrls">
-            <button className="ctrl" onClick={goPrevPage}><Ic n="prev" s={13}/></button>
-            <button className="ctrl" onClick={()=>setProg(p=>Math.max(0,p-3))}><Ic n="rwd" s={14}/></button>
-            <button className={`pp${ttsOn?" spk":""}`} onClick={()=>{ if(ttsOn) stopTTS(); else { setView("reader"); setTimeout(doTTS,100); } }}>
-              <Ic n={ttsOn?"pause":"play"} s={15}/>
-            </button>
-            <button className="ctrl" onClick={()=>setProg(p=>Math.min(100,p+3))}><Ic n="fwd" s={14}/></button>
-            <button className="ctrl" onClick={goNextPage}><Ic n="next" s={13}/></button>
+            <button className="ctrl" title="الفصل السابق" onClick={goPrevPage}><Ic n="prev" s={14}/></button>
+            <button className="ctrl" title="30 ثانية للخلف" onClick={()=>setProg(p=>Math.max(0,p-3))}><Ic n="rwd" s={15}/></button>
+
+            {/* زر التشغيل الرئيسي — ثابت وواضح دائماً */}
+            <div className="pp-label">
+              <button
+                className={`pp${ttsOn?" spk":""}`}
+                title={ttsOn?"إيقاف مؤقت":"تشغيل"}
+                onClick={()=>{ if(ttsOn) stopTTS(); else { setView("reader"); setTimeout(doTTS,100); } }}>
+                <Ic n={ttsOn?"pause":"play"} s={20}/>
+              </button>
+              <span style={{color: ttsOn?"var(--purple)":"var(--a3)"}}>
+                {ttsOn ? "⏸ إيقاف مؤقت" : "▶ تشغيل"}
+              </span>
+            </div>
+
+            <button className="ctrl" title="30 ثانية للأمام" onClick={()=>setProg(p=>Math.min(100,p+3))}><Ic n="fwd" s={15}/></button>
+            <button className="ctrl" title="الفصل التالي" onClick={goNextPage}><Ic n="next" s={14}/></button>
           </div>
+
           <div className="pright">
             <span className="tlbl">{fmtT(prog)}</span>
             <div className="ptrack" onClick={e=>{const r=e.currentTarget.getBoundingClientRect();setProg(Math.max(0,Math.min(100,((e.clientX-r.left)/r.width)*100)));}}>
@@ -1145,11 +1157,13 @@ function App() {
             </div>
             <span className="tlbl">{book?`${book.pages||0} ص`:""}</span>
           </div>
+
           <div className="spdg">
             <button className="spdb" onClick={()=>{setSpeed(s=>Math.max(0.5,Math.round((s-.25)*4)/4));if(ttsOn)stopTTS();}}>−</button>
-            <span className="spdv">{speed.toFixed(2).replace(/\.?0+$/,"")}×</span>
+            <span className="spdv">{speed % 1 === 0 ? speed+"×" : speed.toFixed(2).replace(/0+$/,"")+"×"}</span>
             <button className="spdb" onClick={()=>{setSpeed(s=>Math.min(4,Math.round((s+.25)*4)/4));if(ttsOn)stopTTS();}}>+</button>
           </div>
+
           <div className="vind" onClick={()=>{setAiTab("voices");setView("reader");}}>
             <Ic n="mic" s={12}/>
             <span style={{fontSize:11,color:"var(--t2)"}}>{voice.label}</span>
