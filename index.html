@@ -4,28 +4,64 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>قارئ — مكتبة صوتية عربية</title>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- PDF.js لقراءة ملفات PDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <!-- React + Babel -->
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <style>
+    body { margin:0; background:#0d1117; }
+    #root { height:100vh; }
+    #loading {
+      position:fixed; inset:0; background:#0d1117;
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      color:#39d387; font-family:'Tajawal',sans-serif; gap:12px; z-index:9999;
+    }
+    #loading .spinner {
+      width:40px; height:40px; border:3px solid rgba(57,211,135,.2);
+      border-top-color:#39d387; border-radius:50%;
+      animation:spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&display=swap');
+  </style>
 </head>
 <body>
+  <div id="loading">
+    <div class="spinner"></div>
+    <div style="font-size:14px">جارٍ تحميل قارئ...</div>
+  </div>
   <div id="root"></div>
-  <script type="text/babel" data-presets="react">
-// ── استخدام كائن React العام بدلاً من import ────────────────────────────────
-const { useState, useRef, useEffect, useCallback } = React;
 
-// ── API Key management ────────────────────────────────────────────────────────
-let _apiKey = "";
+<script type="text/babel" data-presets="react,env" data-plugins="transform-class-properties">
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+// ── PDF.js setup ─────────────────────────────────────────────────────────────
+if (window.pdfjsLib) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+
+// ── localStorage helpers ──────────────────────────────────────────────────────
+const LS = {
+  get: (k, def=null) => { try { const v=localStorage.getItem(k); return v?JSON.parse(v):def; } catch{return def;} },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch{} },
+  del: (k) => { try { localStorage.removeItem(k); } catch{} },
+};
+
+// ── API Key (also saved in localStorage) ─────────────────────────────────────
+let _apiKey = LS.get('qaree_api_key','');
 const getKey = () => _apiKey;
-const setKey = (k) => { _apiKey = k.trim(); };
+const saveApiKey = (k) => { _apiKey = k.trim(); LS.set('qaree_api_key', k.trim()); };
+const clearApiKey = () => { _apiKey=''; LS.del('qaree_api_key'); };
 
-// ── Anthropic API (streaming) ─────────────────────────────────────────────────
-async function callClaude(system, userMsg, onChunk, imageB64 = null) {
+// ── Anthropic API ─────────────────────────────────────────────────────────────
+async function callClaude(system, userMsg, onChunk, imageB64=null) {
   const key = getKey();
   if (!key) throw new Error("NO_KEY");
   const content = imageB64
-    ? [{ type:"image", source:{type:"base64", media_type:"image/jpeg", data:imageB64} },
-       { type:"text", text:userMsg }]
+    ? [{type:"image",source:{type:"base64",media_type:"image/jpeg",data:imageB64}},{type:"text",text:userMsg}]
     : userMsg;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method:"POST",
@@ -36,8 +72,8 @@ async function callClaude(system, userMsg, onChunk, imageB64 = null) {
       "anthropic-dangerous-direct-browser-access":"true",
     },
     body: JSON.stringify({
-      model:"claude-sonnet-4-20250514", max_tokens:1500,
-      system, messages:[{role:"user", content}], stream:true,
+      model:"claude-sonnet-4-20250514", max_tokens:2000,
+      system, messages:[{role:"user",content}], stream:true,
     }),
   });
   if (res.status===401) throw new Error("INVALID_KEY");
@@ -58,6 +94,37 @@ async function callClaude(system, userMsg, onChunk, imageB64 = null) {
   return full;
 }
 
+// ── PDF Reader ────────────────────────────────────────────────────────────────
+async function extractPDFText(file) {
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data: buffer}).promise;
+  let fullText = "";
+  const chapters = [];
+  for (let i=1; i<=pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items.map(item=>item.str).join(" ").trim();
+    if (pageText) {
+      fullText += pageText + "\n\n";
+      if (i===1 || i%20===0) chapters.push(`الصفحة ${i}`);
+    }
+  }
+  return { text: fullText.trim(), pages: pdf.numPages, chapters };
+}
+
+// ── URL Proxy (via allorigins) ────────────────────────────────────────────────
+async function fetchURL(url) {
+  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+  const res = await fetch(proxy);
+  if (!res.ok) throw new Error("فشل في جلب الرابط");
+  const data = await res.json();
+  // strip HTML tags
+  const div = document.createElement('div');
+  div.innerHTML = data.contents;
+  const text = div.innerText || div.textContent || "";
+  return text.replace(/\s+/g,' ').trim().slice(0,50000);
+}
+
 // ── Arabic TTS ────────────────────────────────────────────────────────────────
 const VOICES = [
   {id:"ar-SA-m", label:"خالد",  dialect:"خليجي",  lang:"ar-SA", pitch:0.90, rate:1.00, gender:"m"},
@@ -73,22 +140,20 @@ class TTS {
     this.s = window.speechSynthesis;
     this.vs = [];
     this.cur = null;
-    if (this.s) { this.s.onvoiceschanged = () => { this.vs = this.s.getVoices(); }; this.vs = this.s.getVoices(); }
+    if (this.s) { this.s.onvoiceschanged = ()=>{ this.vs=this.s.getVoices(); }; this.vs=this.s.getVoices(); }
   }
-  getVoice(cfg) {
-    return this.vs.find(v=>v.lang===cfg.lang) || this.vs.find(v=>v.lang.startsWith("ar")) || null;
-  }
+  getVoice(cfg) { return this.vs.find(v=>v.lang===cfg.lang)||this.vs.find(v=>v.lang.startsWith("ar"))||null; }
   speak(text, cfg, rate=1, onWord=null, onEnd=null) {
     this.stop();
     if (!this.s) return false;
     const u = new SpeechSynthesisUtterance(text);
     const v = this.getVoice(cfg);
-    if (v) u.voice = v;
+    if (v) u.voice=v;
     u.lang=cfg.lang; u.pitch=cfg.pitch; u.rate=cfg.rate*rate; u.volume=1;
-    if (onWord) u.onboundary = e => onWord(e.charIndex);
-    if (onEnd)  u.onend = onEnd;
-    u.onerror = e => { if (e.error!=="interrupted") console.warn(e.error); };
-    this.cur = u; this.s.speak(u); return true;
+    if (onWord) u.onboundary=e=>onWord(e.charIndex);
+    if (onEnd) u.onend=onEnd;
+    u.onerror=e=>{ if(e.error!=="interrupted") console.warn(e.error); };
+    this.cur=u; this.s.speak(u); return true;
   }
   pause()  { this.s?.pause(); }
   resume() { this.s?.resume(); }
@@ -98,71 +163,68 @@ class TTS {
 }
 const tts = new TTS();
 
-// ── Data ──────────────────────────────────────────────────────────────────────
-const BOOKS = [
+// ── Default Books ─────────────────────────────────────────────────────────────
+const DEFAULT_BOOKS = [
   { id:1, title:"مئة عام من العزلة", author:"غابرييل ماركيز", type:"رواية",
     progress:34, color:"#1a6b4a", icon:"📗",
     chapters:["البداية والتأسيس","عائلة بوينديا","الحرب الأهلية","العزلة والحب","النهاية"],
-    summary:"رواية ملحمية عن عائلة بوينديا وتأسيس مدينة ماكوندو الخيالية في كولومبيا، تمتد عبر مئة عام من الأحداث السحرية والواقعية.",
-    excerpt:"في البدء كانت ماكوندو قرية صغيرة تضم عشرين داراً من الطين والقصب، مشيدة على ضفاف نهر تتلألأ مياهه الشفافة على قاع أبيض ناصع من الحجارة الضخمة الملساء. كان العالم فتياً لدرجة أن كثيراً من الأشياء لم يكن لها اسم بعد، وكان للإشارة إليها ينبغي الإشارة بالأصبع." },
+    summary:"رواية ملحمية عن عائلة بوينديا وتأسيس مدينة ماكوندو الخيالية في كولومبيا.",
+    excerpt:"في البدء كانت ماكوندو قرية صغيرة تضم عشرين داراً من الطين والقصب، مشيدة على ضفاف نهر تتلألأ مياهه الشفافة على قاع أبيض ناصع من الحجارة الضخمة الملساء. كان العالم فتياً لدرجة أن كثيراً من الأشياء لم يكن لها اسم بعد.",
+    pages:412 },
   { id:2, title:"العادات الذرية", author:"جيمس كلير", type:"تطوير ذاتي",
     progress:72, color:"#1a4480", icon:"📘",
     chapters:["مقدمة في العادات","قانون الوضوح","قانون الجاذبية","قانون السهولة","قانون الرضا"],
-    summary:"دليل عملي لبناء عادات جيدة والتخلص من العادات السيئة من خلال تغييرات صغيرة تتراكم لتحقيق نتائج رائعة.",
-    excerpt:"التغييرات الصغيرة تبدو وكأنها لا تُحدث أي فرق حتى تتجاوز عتبة حرجة، وتنكشف أمامك مستوى جديد من الأداء. كل العمل السابق لم يكن هباءً بل كان تراكماً نحو الهدف الأسمى." },
+    summary:"دليل عملي لبناء عادات جيدة والتخلص من العادات السيئة.",
+    excerpt:"التغييرات الصغيرة تبدو وكأنها لا تُحدث أي فرق حتى تتجاوز عتبة حرجة، وتنكشف أمامك مستوى جديد من الأداء. كل العمل السابق لم يكن هباءً بل كان تراكماً نحو الهدف الأسمى.",
+    pages:320 },
   { id:3, title:"مقدمة ابن خلدون", author:"عبد الرحمن ابن خلدون", type:"تاريخ",
     progress:100, color:"#7a3b1e", icon:"📙",
     chapters:["فصل في العمران","طبائع العمران","الدول والملك","العصبية","الصنائع والمعاش"],
-    summary:"أول محاولة علمية لفهم قوانين التاريخ والاجتماع البشري وضعها ابن خلدون في القرن الرابع عشر الميلادي.",
-    excerpt:"العصبية أصلها النعرة على ذوي القربى والأرحام إذا نالهم ظلم أو وصلت إليهم بادرة من قبل العدو. وهي أمر طبيعي في البشر إلا من عصمه الله." },
-  { id:4, title:"ألف ليلة وليلة", author:"مجهول الهوية", type:"تراث",
-    progress:8, color:"#5a1a7a", icon:"📕",
-    chapters:["ليلة شهرزاد","علاء الدين","علي بابا","السندباد البحري","الأميرة الساحرة"],
-    summary:"مجموعة من القصص الخيالية والحكايات الشعبية جُمعت من ثقافات متعددة عبر عصور مختلفة.",
-    excerpt:"حُكي أن شهريار لما رأى وفاء امرأته شهرزاد وسمع حكاياتها الألف والليلة جلس إليها وقال: يا شهرزاد قد وهبتك حياتك لما أسديتِ إلى الناس من فوائد حكاياتك." },
+    summary:"أول محاولة علمية لفهم قوانين التاريخ والاجتماع البشري.",
+    excerpt:"العصبية أصلها النعرة على ذوي القربى والأرحام إذا نالهم ظلم أو وصلت إليهم بادرة من قبل العدو. وهي أمر طبيعي في البشر إلا من عصمه الله.",
+    pages:800 },
 ];
 
 const DICT = {
   "العزلة":"الانفراد والبُعد عن الناس",
   "العصبية":"الميل للدفاع عن الجماعة والتعصب لها",
   "الملحمة":"قصيدة طويلة تروي أحداثاً بطولية",
-  "ماكوندو":"مدينة خيالية في رواية ماركيز",
   "العمران":"الحضارة والمدنية والتقدم البشري",
   "التراكم":"تجمّع الأشياء ببطء على مدار الزمن",
   "الصنائع":"الحِرَف والمهن والفنون التطبيقية",
   "العتبة":"الحد الفاصل الذي عنده يتغير الحال",
   "شهرزاد":"راوية الحكايات في ألف ليلة وليلة",
-  "السندباد":"شخصية تراثية مغامرة من ألف ليلة وليلة",
 };
 
-// ── SVG Icons ─────────────────────────────────────────────────────────────────
+// ── Icons ─────────────────────────────────────────────────────────────────────
 const Ic = ({n, s=16}) => {
   const p = {width:s,height:s,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2};
   const f = {...p,fill:"currentColor",stroke:"none"};
   const map = {
-    play:    <svg {...f}><polygon points="5,3 19,12 5,21"/></svg>,
-    pause:   <svg {...f}><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>,
-    prev:    <svg {...p}><polygon points="19,3 5,12 19,21" fill="currentColor"/><rect x="5" y="3" width="2" height="18" fill="currentColor"/></svg>,
-    next:    <svg {...p}><polygon points="5,3 19,12 5,21" fill="currentColor"/><rect x="17" y="3" width="2" height="18" fill="currentColor"/></svg>,
-    rwd:     <svg {...p}><polyline points="1,4 1,10 7,10"/><path d="M3.51 15a9 9 0 1 0 .49-3.5"/></svg>,
-    fwd:     <svg {...p}><polyline points="23,4 23,10 17,10"/><path d="M20.49 15a9 9 0 1 1-.49-3.5"/></svg>,
-    search:  <svg {...p}><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
-    upload:  <svg {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
-    camera:  <svg {...p}><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>,
-    link:    <svg {...p}><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>,
-    text:    <svg {...p}><line x1="17" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="17" y1="18" x2="3" y2="18"/></svg>,
-    star:    <svg {...f}><polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/></svg>,
-    brain:   <svg {...p}><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg>,
-    list:    <svg {...p}><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>,
-    dict:    <svg {...p}><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><line x1="12" y1="6" x2="12" y2="12"/><line x1="9" y1="9" x2="15" y2="9"/></svg>,
-    x:       <svg {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
-    bkmk:    <svg {...p}><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>,
-    check:   <svg {...p} strokeWidth={2.5}><polyline points="20,6 9,17 4,12"/></svg>,
-    mic:     <svg {...p}><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>,
-    voice:   <svg {...p}><polygon points="11,5 6,9 2,9 2,15 6,15 11,19 11,5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>,
-    key:     <svg {...p}><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>,
-    scan:    <svg {...p}><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>,
-    chat:    <svg {...p}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>,
+    play:   <svg {...f}><polygon points="5,3 19,12 5,21"/></svg>,
+    pause:  <svg {...f}><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>,
+    prev:   <svg {...p}><polygon points="19,3 5,12 19,21" fill="currentColor"/><rect x="5" y="3" width="2" height="18" fill="currentColor"/></svg>,
+    next:   <svg {...p}><polygon points="5,3 19,12 5,21" fill="currentColor"/><rect x="17" y="3" width="2" height="18" fill="currentColor"/></svg>,
+    rwd:    <svg {...p}><polyline points="1,4 1,10 7,10"/><path d="M3.51 15a9 9 0 1 0 .49-3.5"/></svg>,
+    fwd:    <svg {...p}><polyline points="23,4 23,10 17,10"/><path d="M20.49 15a9 9 0 1 1-.49-3.5"/></svg>,
+    search: <svg {...p}><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
+    upload: <svg {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
+    camera: <svg {...p}><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>,
+    link:   <svg {...p}><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>,
+    text:   <svg {...p}><line x1="17" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="17" y1="18" x2="3" y2="18"/></svg>,
+    star:   <svg {...f}><polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/></svg>,
+    brain:  <svg {...p}><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg>,
+    list:   <svg {...p}><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>,
+    dict:   <svg {...p}><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><line x1="12" y1="6" x2="12" y2="12"/><line x1="9" y1="9" x2="15" y2="9"/></svg>,
+    x:      <svg {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
+    bkmk:   <svg {...p}><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>,
+    check:  <svg {...p} strokeWidth={2.5}><polyline points="20,6 9,17 4,12"/></svg>,
+    mic:    <svg {...p}><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>,
+    voice:  <svg {...p}><polygon points="11,5 6,9 2,9 2,15 6,15 11,19 11,5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>,
+    key:    <svg {...p}><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>,
+    scan:   <svg {...p}><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>,
+    chat:   <svg {...p}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>,
+    trash:  <svg {...p}><polyline points="3,6 5,6 21,6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>,
   };
   return map[n]||null;
 };
@@ -184,42 +246,29 @@ body{background:var(--bg);color:var(--t);font-family:'Tajawal',sans-serif;direct
 ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:2px}
 
-/* SHELL */
 .shell{display:grid;grid-template-rows:54px 1fr 88px;grid-template-columns:208px 1fr 292px;height:100vh;overflow:hidden}
 
 /* NAV */
-.nav{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 16px;
-  background:var(--bg2);border-bottom:1px solid var(--bd)}
+.nav{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:0 16px;background:var(--bg2);border-bottom:1px solid var(--bd)}
 .logo{display:flex;align-items:center;gap:8px;font-size:16px;font-weight:700;white-space:nowrap;flex-shrink:0}
-.lm{width:30px;height:30px;background:linear-gradient(135deg,var(--a),var(--a2));border-radius:8px;
-  display:flex;align-items:center;justify-content:center;font-size:16px;font-family:'Amiri',serif;
-  color:#fff;font-weight:700}
+.lm{width:30px;height:30px;background:linear-gradient(135deg,var(--a),var(--a2));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;font-family:'Amiri',serif;color:#fff;font-weight:700}
 .nsearch{flex:1;max-width:320px;position:relative}
-.nsearch input{width:100%;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;
-  padding:6px 10px 6px 32px;color:var(--t);font-family:'Tajawal',sans-serif;font-size:13px;
-  direction:rtl;transition:border-color .2s}
+.nsearch input{width:100%;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;padding:6px 10px 6px 32px;color:var(--t);font-family:'Tajawal',sans-serif;font-size:13px;direction:rtl;transition:border-color .2s}
 .nsearch input:focus{outline:none;border-color:var(--a)}
 .nsearch .si{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--t3)}
 .ntabs{display:flex;gap:2px;background:var(--bg3);padding:3px;border-radius:9px}
-.ntab{padding:5px 12px;font-size:13px;font-family:'Tajawal',sans-serif;border:none;cursor:pointer;
-  border-radius:6px;background:transparent;color:var(--t2);transition:all .15s;white-space:nowrap}
+.ntab{padding:5px 12px;font-size:13px;font-family:'Tajawal',sans-serif;border:none;cursor:pointer;border-radius:6px;background:transparent;color:var(--t2);transition:all .15s;white-space:nowrap}
 .ntab.on{background:var(--a);color:#fff;font-weight:500}
 .ntab:hover:not(.on){background:var(--bd);color:var(--t)}
-.abtn{display:flex;align-items:center;gap:5px;background:var(--a);color:#fff;border:none;
-  padding:6px 12px;border-radius:8px;font-family:'Tajawal',sans-serif;font-size:13px;font-weight:500;
-  cursor:pointer;transition:background .15s;white-space:nowrap;flex-shrink:0}
+.abtn{display:flex;align-items:center;gap:5px;background:var(--a);color:#fff;border:none;padding:6px 12px;border-radius:8px;font-family:'Tajawal',sans-serif;font-size:13px;font-weight:500;cursor:pointer;transition:background .15s;white-space:nowrap;flex-shrink:0}
 .abtn:hover{background:var(--a2)}
-.kbtn{display:flex;align-items:center;gap:5px;background:var(--bg3);border:1px solid var(--bd2);
-  color:var(--t2);padding:5px 10px;border-radius:8px;font-family:'Tajawal',sans-serif;font-size:12px;
-  cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0}
+.kbtn{display:flex;align-items:center;gap:5px;background:var(--bg3);border:1px solid var(--bd2);color:var(--t2);padding:5px 10px;border-radius:8px;font-family:'Tajawal',sans-serif;font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0}
 .kbtn:hover,.kbtn.on{border-color:var(--a);color:var(--a3);background:rgba(46,168,110,.08)}
 
 /* SIDEBAR */
-.sb{background:var(--bg2);border-left:1px solid var(--bd);overflow-y:auto;padding:10px 6px;
-  display:flex;flex-direction:column;gap:1px}
+.sb{background:var(--bg2);border-left:1px solid var(--bd);overflow-y:auto;padding:10px 6px;display:flex;flex-direction:column;gap:1px}
 .sbs{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;padding:10px 9px 5px;font-weight:700}
-.sbi{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:8px;font-size:13px;
-  color:var(--t2);cursor:pointer;transition:all .12s;font-family:'Tajawal',sans-serif}
+.sbi{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:8px;font-size:13px;color:var(--t2);cursor:pointer;transition:all .12s;font-family:'Tajawal',sans-serif}
 .sbi.on{background:rgba(46,168,110,.13);color:var(--a3)}
 .sbi:hover:not(.on){background:var(--bd);color:var(--t)}
 .sbadge{margin-right:auto;font-size:10px;background:var(--a2);color:var(--a3);padding:1px 7px;border-radius:10px}
@@ -229,121 +278,97 @@ body{background:var(--bg);color:var(--t);font-family:'Tajawal',sans-serif;direct
 .sh{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .st{font-size:14px;font-weight:700;color:var(--t)}
 .frow{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:14px}
-.fp{padding:4px 11px;border-radius:20px;font-size:12px;border:1px solid var(--bd2);cursor:pointer;
-  background:transparent;color:var(--t2);font-family:'Tajawal',sans-serif;transition:all .15s}
+.fp{padding:4px 11px;border-radius:20px;font-size:12px;border:1px solid var(--bd2);cursor:pointer;background:transparent;color:var(--t2);font-family:'Tajawal',sans-serif;transition:all .15s}
 .fp.on{background:var(--a);border-color:var(--a);color:#fff}
 .fp:hover:not(.on){border-color:var(--a);color:var(--a3)}
 
-/* BOOK GRID */
+/* BOOKS */
 .bgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(142px,1fr));gap:10px;margin-bottom:22px}
-.bc{background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;
-  cursor:pointer;transition:all .2s}
+.bc{background:var(--bg2);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;cursor:pointer;transition:all .2s;position:relative}
 .bc:hover{border-color:var(--bd2);transform:translateY(-3px);box-shadow:var(--sh)}
 .bc.sel{border-color:var(--a);box-shadow:0 0 0 1px var(--a)}
-.bcover{height:106px;display:flex;align-items:center;justify-content:center;font-size:35px;
-  position:relative;overflow:hidden}
+.bcover{height:106px;display:flex;align-items:center;justify-content:center;font-size:35px;position:relative;overflow:hidden}
 .bcover::after{content:'';position:absolute;inset:0;background:linear-gradient(to bottom,transparent 50%,rgba(0,0,0,.5))}
-.bpct{position:absolute;bottom:6px;left:6px;font-size:10px;background:rgba(0,0,0,.7);color:#fff;
-  padding:2px 6px;border-radius:5px;z-index:1;font-family:'Tajawal',sans-serif}
+.bpct{position:absolute;bottom:6px;left:6px;font-size:10px;background:rgba(0,0,0,.7);color:#fff;padding:2px 6px;border-radius:5px;z-index:1;font-family:'Tajawal',sans-serif}
 .bbar{position:absolute;bottom:0;left:0;right:0;height:3px;background:rgba(255,255,255,.1);z-index:2}
 .bfill{height:100%;background:var(--a3);transition:width .4s}
 .bbody{padding:8px 9px}
-.btitle{font-size:12px;font-weight:700;color:var(--t);margin-bottom:2px;line-height:1.4;
-  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.btitle{font-size:12px;font-weight:700;color:var(--t);margin-bottom:2px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .bauthor{font-size:11px;color:var(--t3);margin-bottom:5px}
 .btag{font-size:10px;padding:2px 7px;border-radius:5px;background:rgba(46,168,110,.13);color:var(--a3)}
+.bdel{position:absolute;top:6px;left:6px;z-index:3;background:rgba(0,0,0,.6);border:none;border-radius:5px;padding:3px;cursor:pointer;color:#f87171;display:none;align-items:center;justify-content:center}
+.bc:hover .bdel{display:flex}
 
 /* AI PANEL */
 .aip{background:var(--bg2);border-right:1px solid var(--bd);display:flex;flex-direction:column;overflow:hidden}
-.aihead{padding:12px 14px 8px;border-bottom:1px solid var(--bd);display:flex;align-items:center;
-  gap:7px;font-size:13px;font-weight:700;flex-shrink:0}
+.aihead{padding:12px 14px 8px;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;flex-shrink:0}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--a3);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
 .aitabs{display:flex;border-bottom:1px solid var(--bd);flex-shrink:0;overflow-x:auto}
 .aitabs::-webkit-scrollbar{height:0}
-.aitab{flex-shrink:0;padding:7px 6px;font-size:11px;font-family:'Tajawal',sans-serif;
-  cursor:pointer;border:none;background:transparent;color:var(--t3);
-  border-bottom:2px solid transparent;transition:all .15s;display:flex;align-items:center;gap:3px}
+.aitab{flex-shrink:0;padding:7px 6px;font-size:11px;font-family:'Tajawal',sans-serif;cursor:pointer;border:none;background:transparent;color:var(--t3);border-bottom:2px solid transparent;transition:all .15s;display:flex;align-items:center;gap:3px}
 .aitab.on{color:var(--a3);border-bottom-color:var(--a)}
 .aitab:hover:not(.on){color:var(--t2)}
 .aibody{flex:1;overflow-y:auto;padding:12px 12px 6px;display:flex;flex-direction:column;gap:8px}
-.aim{background:var(--bg3);border-radius:10px;padding:9px 11px;font-size:13px;color:var(--t2);
-  line-height:1.75;font-family:'Tajawal',sans-serif}
+.aim{background:var(--bg3);border-radius:10px;padding:9px 11px;font-size:13px;color:var(--t2);line-height:1.75;font-family:'Tajawal',sans-serif}
 .aim.bot{background:rgba(46,168,110,.09);border:1px solid rgba(46,168,110,.2);color:var(--t)}
 .aim strong{color:var(--a3);font-weight:700}
 .aiqrow{display:flex;flex-wrap:wrap;gap:5px;flex-shrink:0;padding:0 12px 6px}
-.aiq{font-size:11px;padding:4px 9px;background:var(--bg3);border:1px solid var(--bd2);
-  border-radius:20px;color:var(--t2);cursor:pointer;font-family:'Tajawal',sans-serif;
-  transition:all .15s;white-space:nowrap}
+.aiq{font-size:11px;padding:4px 9px;background:var(--bg3);border:1px solid var(--bd2);border-radius:20px;color:var(--t2);cursor:pointer;font-family:'Tajawal',sans-serif;transition:all .15s;white-space:nowrap}
 .aiq:hover{background:rgba(46,168,110,.13);border-color:var(--a);color:var(--a3)}
 .aiinrow{display:flex;gap:5px;padding:8px 12px 12px;flex-shrink:0;border-top:1px solid var(--bd)}
-.aiinrow input{flex:1;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;
-  padding:7px 9px;color:var(--t);font-family:'Tajawal',sans-serif;font-size:12px;direction:rtl;
-  transition:border-color .15s}
+.aiinrow input{flex:1;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;padding:7px 9px;color:var(--t);font-family:'Tajawal',sans-serif;font-size:12px;direction:rtl;transition:border-color .15s}
 .aiinrow input:focus{outline:none;border-color:var(--a)}
-.aisend{background:var(--a);border:none;color:#fff;padding:7px 11px;border-radius:8px;
-  cursor:pointer;font-size:13px;transition:background .15s}
+.aisend{background:var(--a);border:none;color:#fff;padding:7px 11px;border-radius:8px;cursor:pointer;font-size:13px;transition:background .15s}
 .aisend:hover{background:var(--a2)}
 .aisend:disabled{opacity:.4;cursor:not-allowed}
 
-/* VOICE CARDS */
-.vc{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;
-  border:1px solid var(--bd);cursor:pointer;transition:all .15s;background:var(--bg3)}
+/* VOICES */
+.vc{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:9px;border:1px solid var(--bd);cursor:pointer;transition:all .15s;background:var(--bg3)}
 .vc:hover{border-color:var(--bd2)}
 .vc.on{border-color:var(--a);background:rgba(46,168,110,.07)}
 .vavatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:15px}
 .vname{font-size:13px;font-weight:500;color:var(--t)}
 .vsub{font-size:11px;color:var(--t3)}
-.vtbtn{margin-right:auto;font-size:11px;padding:3px 9px;background:var(--bg4);
-  border:1px solid var(--bd2);border-radius:5px;color:var(--t2);cursor:pointer;
-  font-family:'Tajawal',sans-serif;transition:all .15s;flex-shrink:0}
+.vtbtn{margin-right:auto;font-size:11px;padding:3px 9px;background:var(--bg4);border:1px solid var(--bd2);border-radius:5px;color:var(--t2);cursor:pointer;font-family:'Tajawal',sans-serif;transition:all .15s;flex-shrink:0}
 .vtbtn:hover,.vtbtn.on{border-color:var(--a3);color:var(--a3);background:rgba(46,168,110,.1)}
 
 /* OCR */
-.odrop{border:2px dashed var(--bd2);border-radius:12px;padding:24px 16px;text-align:center;
-  cursor:pointer;transition:all .2s;font-family:'Tajawal',sans-serif}
+.odrop{border:2px dashed var(--bd2);border-radius:12px;padding:24px 16px;text-align:center;cursor:pointer;transition:all .2s;font-family:'Tajawal',sans-serif}
 .odrop:hover{border-color:var(--a);background:rgba(46,168,110,.04)}
-.odrop.drag{border-color:var(--a3);background:rgba(57,211,135,.06)}
-.ores{background:var(--bg3);border:1px solid var(--bd);border-radius:10px;padding:12px;
-  font-family:'Amiri',serif;font-size:15px;line-height:2;direction:rtl;color:var(--t);
-  max-height:260px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
-.oimg{width:100%;max-height:160px;object-fit:cover;border-radius:8px;margin-bottom:8px;border:1px solid var(--bd)}
+.ores{background:var(--bg3);border:1px solid var(--bd);border-radius:10px;padding:12px;font-family:'Amiri',serif;font-size:15px;line-height:2;direction:rtl;color:var(--t);max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+.oimg{width:100%;max-height:140px;object-fit:cover;border-radius:8px;margin-bottom:8px;border:1px solid var(--bd)}
 
 /* DICT */
-.de{display:flex;align-items:flex-start;gap:8px;padding:9px;background:var(--bg3);
-  border-radius:8px;border:1px solid var(--bd)}
+.de{display:flex;align-items:flex-start;gap:8px;padding:9px;background:var(--bg3);border-radius:8px;border:1px solid var(--bd)}
 .dw{font-family:'Amiri',serif;font-size:17px;color:var(--gold);font-weight:700;white-space:nowrap}
 .dd{font-size:12px;color:var(--t2);line-height:1.6}
 
-/* WORD HIGHLIGHT */
-.wh{color:var(--gold);font-family:'Amiri',serif;font-weight:700;cursor:help;
-  border-bottom:1px dashed rgba(212,168,67,.45);position:relative;display:inline}
-.wtt{position:absolute;bottom:calc(100% + 5px);right:0;background:var(--bg3);
-  border:1px solid var(--bd2);border-radius:8px;padding:8px 10px;min-width:155px;
-  font-size:12px;color:var(--t);z-index:50;white-space:normal;line-height:1.5;
-  box-shadow:var(--sh);pointer-events:none;font-family:'Tajawal',sans-serif}
+/* READER */
+.wh{color:var(--gold);font-family:'Amiri',serif;font-weight:700;cursor:help;border-bottom:1px dashed rgba(212,168,67,.45);position:relative;display:inline}
+.wtt{position:absolute;bottom:calc(100% + 5px);right:0;background:var(--bg3);border:1px solid var(--bd2);border-radius:8px;padding:8px 10px;min-width:155px;font-size:12px;color:var(--t);z-index:50;white-space:normal;line-height:1.5;box-shadow:var(--sh);pointer-events:none;font-family:'Tajawal',sans-serif}
 .ttsw{transition:background .1s;border-radius:2px}
 .ttsw.hi{background:rgba(57,211,135,.25);color:var(--a3)}
+.page-nav{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px;padding:8px}
+.pnbtn{background:var(--bg3);border:1px solid var(--bd);border-radius:8px;padding:6px 14px;font-size:12px;color:var(--t2);cursor:pointer;font-family:'Tajawal',sans-serif;transition:all .15s}
+.pnbtn:hover:not(:disabled){border-color:var(--a);color:var(--a3)}
+.pnbtn:disabled{opacity:.35;cursor:not-allowed}
 
-/* SEARCH RESULTS */
-.sres{background:var(--bg3);border-radius:8px;padding:9px 11px;margin-bottom:5px;
-  border:1px solid var(--bd);font-size:12px;color:var(--t2);line-height:1.7}
+/* SEARCH */
+.sres{background:var(--bg3);border-radius:8px;padding:9px 11px;margin-bottom:5px;border:1px solid var(--bd);font-size:12px;color:var(--t2);line-height:1.7}
 .sres mark{background:rgba(46,168,110,.28);color:var(--a3);border-radius:2px;padding:0 2px}
 .sloc{font-size:10px;color:var(--t3);margin-bottom:3px}
 
 /* PLAYER */
-.player{grid-column:1/-1;background:var(--bg2);border-top:1px solid var(--bd);
-  display:flex;align-items:center;gap:12px;padding:0 16px}
+.player{grid-column:1/-1;background:var(--bg2);border-top:1px solid var(--bd);display:flex;align-items:center;gap:12px;padding:0 16px}
 .pbk{display:flex;align-items:center;gap:9px;width:186px;flex-shrink:0}
 .pcover{width:40px;height:40px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:20px}
 .ptitle{font-size:12px;font-weight:700;color:var(--t);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .pch{font-size:11px;color:var(--t3)}
 .pctrls{display:flex;align-items:center;gap:6px;flex-shrink:0}
-.ctrl{background:none;border:none;cursor:pointer;color:var(--t2);padding:5px;border-radius:50%;
-  display:flex;align-items:center;justify-content:center;transition:all .12s}
+.ctrl{background:none;border:none;cursor:pointer;color:var(--t2);padding:5px;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:all .12s}
 .ctrl:hover{color:var(--t);background:var(--bd)}
-.pp{width:38px;height:38px;background:var(--a);color:#fff;border-radius:50%;border:none;
-  cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
+.pp{width:38px;height:38px;background:var(--a);color:#fff;border-radius:50%;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
 .pp:hover{background:var(--a2)}
 .pp.spk{background:var(--purple)}
 .pright{display:flex;align-items:center;gap:11px;flex:1}
@@ -352,51 +377,39 @@ body{background:var(--bg);color:var(--t);font-family:'Tajawal',sans-serif;direct
 .pfill{height:100%;background:var(--a);border-radius:2px;transition:width .1s}
 .ptrack:hover .pfill{background:var(--a3)}
 .spdg{display:flex;align-items:center;gap:4px;flex-shrink:0}
-.spdb{background:var(--bg3);border:1px solid var(--bd);color:var(--t2);padding:4px 8px;
-  border-radius:5px;font-size:12px;cursor:pointer;font-family:'Tajawal',sans-serif;transition:all .12s}
+.spdb{background:var(--bg3);border:1px solid var(--bd);color:var(--t2);padding:4px 8px;border-radius:5px;font-size:12px;cursor:pointer;font-family:'Tajawal',sans-serif;transition:all .12s}
 .spdb:hover{border-color:var(--a);color:var(--a3)}
 .spdv{font-size:13px;font-weight:700;color:var(--a3);min-width:32px;text-align:center}
-.vind{display:flex;align-items:center;gap:5px;flex-shrink:0;padding:4px 9px;background:var(--bg3);
-  border-radius:8px;border:1px solid var(--bd);cursor:pointer;transition:all .15s}
+.vind{display:flex;align-items:center;gap:5px;flex-shrink:0;padding:4px 9px;background:var(--bg3);border-radius:8px;border:1px solid var(--bd);cursor:pointer;transition:all .15s}
 .vind:hover{border-color:var(--a)}
 
 /* MODAL */
-.mbg{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;z-index:100}
-.modal{background:var(--bg2);border:1px solid var(--bd2);border-radius:16px;width:480px;
-  max-width:95vw;max-height:90vh;overflow:auto;box-shadow:var(--sh)}
-.mhead{padding:14px 17px;border-bottom:1px solid var(--bd);display:flex;align-items:center;
-  justify-content:space-between;position:sticky;top:0;background:var(--bg2);z-index:1}
+.mbg{position:fixed;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:100}
+.modal{background:var(--bg2);border:1px solid var(--bd2);border-radius:16px;width:490px;max-width:95vw;max-height:90vh;overflow:auto;box-shadow:var(--sh)}
+.mhead{padding:14px 17px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--bg2);z-index:1}
 .mtitle{font-size:15px;font-weight:700}
-.mcls{background:none;border:none;cursor:pointer;color:var(--t2);padding:4px;border-radius:6px;
-  display:flex;transition:all .12s}
+.mcls{background:none;border:none;cursor:pointer;color:var(--t2);padding:4px;border-radius:6px;display:flex;transition:all .12s}
 .mcls:hover{background:var(--bd);color:var(--t)}
 .srctabs{display:flex;border-bottom:1px solid var(--bd)}
-.srctab{flex:1;padding:10px 4px;font-size:12px;font-family:'Tajawal',sans-serif;text-align:center;
-  cursor:pointer;border:none;background:transparent;color:var(--t3);border-bottom:2px solid transparent;
-  display:flex;flex-direction:column;align-items:center;gap:3px;transition:all .15s;font-weight:500}
+.srctab{flex:1;padding:10px 4px;font-size:12px;font-family:'Tajawal',sans-serif;text-align:center;cursor:pointer;border:none;background:transparent;color:var(--t3);border-bottom:2px solid transparent;display:flex;flex-direction:column;align-items:center;gap:3px;transition:all .15s;font-weight:500}
 .srctab.on{color:var(--a3);border-bottom-color:var(--a)}
 .srctab:hover:not(.on){color:var(--t2)}
 .mbody{padding:16px;display:flex;flex-direction:column;gap:10px}
-.mi{width:100%;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;
-  padding:9px 11px;color:var(--t);font-family:'Tajawal',sans-serif;font-size:13px;direction:rtl;
-  resize:vertical;transition:border-color .15s}
+.mi{width:100%;background:var(--bg3);border:1px solid var(--bd);border-radius:8px;padding:9px 11px;color:var(--t);font-family:'Tajawal',sans-serif;font-size:13px;direction:rtl;resize:vertical;transition:border-color .15s}
 .mi:focus{outline:none;border-color:var(--a)}
-.dzone{border:2px dashed var(--bd2);border-radius:12px;padding:26px;text-align:center;
-  cursor:pointer;transition:all .2s;font-family:'Tajawal',sans-serif}
-.dzone:hover{border-color:var(--a);background:rgba(46,168,110,.04)}
-.msub{background:var(--a);border:none;color:#fff;padding:10px;border-radius:8px;
-  font-family:'Tajawal',sans-serif;font-size:14px;font-weight:700;cursor:pointer;
-  transition:background .15s;width:100%}
+.dzone{border:2px dashed var(--bd2);border-radius:12px;padding:26px;text-align:center;cursor:pointer;transition:all .2s;font-family:'Tajawal',sans-serif}
+.dzone:hover,.dzone.drag{border-color:var(--a);background:rgba(46,168,110,.04)}
+.msub{background:var(--a);border:none;color:#fff;padding:10px;border-radius:8px;font-family:'Tajawal',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:background .15s;width:100%}
 .msub:hover{background:var(--a2)}
 .msub:disabled{opacity:.45;cursor:not-allowed}
+.minfo{font-size:12px;color:var(--t3);background:var(--bg3);border-radius:8px;padding:8px 10px;line-height:1.6}
+.merr{font-size:12px;color:var(--red);background:rgba(224,92,92,.08);border:1px solid rgba(224,92,92,.2);border-radius:8px;padding:8px 10px}
 
 /* KEY MODAL */
-.kmodal{background:var(--bg2);border:1px solid var(--a);border-radius:14px;width:420px;
-  max-width:95vw;box-shadow:0 0 0 4px rgba(46,168,110,.1),var(--sh)}
+.kmodal{background:var(--bg2);border:1px solid var(--a);border-radius:14px;width:420px;max-width:95vw;box-shadow:0 0 0 4px rgba(46,168,110,.1),var(--sh)}
 .kinfo{font-size:12px;color:var(--t3);line-height:1.6}
 .krow{display:flex;gap:6px}
-.ksave{background:var(--a);border:none;color:#fff;padding:9px 15px;border-radius:8px;
-  font-family:'Tajawal',sans-serif;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap}
+.ksave{background:var(--a);border:none;color:#fff;padding:9px 15px;border-radius:8px;font-family:'Tajawal',sans-serif;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap}
 .ksave:hover{background:var(--a2)}
 
 /* STATS */
@@ -410,61 +423,104 @@ body{background:var(--bg);color:var(--t);font-family:'Tajawal',sans-serif;direct
 .barf.today{background:var(--a)}
 .bard{font-size:9px;color:var(--t3)}
 
-/* MISC */
+/* RESUME DIALOG */
+.rdlg{background:var(--bg2);border:1px solid var(--a);border-radius:16px;width:360px;max-width:95vw;box-shadow:0 0 0 4px rgba(46,168,110,.1),var(--sh);overflow:hidden}
+.rdlg-cover{height:90px;display:flex;align-items:center;justify-content:center;font-size:42px;position:relative}
+.rdlg-cover::after{content:'';position:absolute;inset:0;background:linear-gradient(to bottom,transparent 40%,var(--bg2))}
+.rdlg-body{padding:16px 18px 18px}
+.rdlg-title{font-size:15px;font-weight:700;color:var(--t);margin-bottom:4px;font-family:'Amiri',serif}
+.rdlg-sub{font-size:12px;color:var(--t3);margin-bottom:16px;line-height:1.6}
+.rdlg-prog{height:5px;background:var(--bd2);border-radius:3px;margin-bottom:16px;overflow:hidden}
+.rdlg-prog-fill{height:100%;background:linear-gradient(to left,var(--a3),var(--a));border-radius:3px;transition:width .5s}
+.rdlg-btns{display:flex;flex-direction:column;gap:8px}
+.rdlg-btn-main{background:var(--a);border:none;color:#fff;padding:11px;border-radius:9px;font-family:'Tajawal',sans-serif;font-size:14px;font-weight:700;cursor:pointer;transition:background .15s;display:flex;align-items:center;justify-content:center;gap:8px}
+.rdlg-btn-main:hover{background:var(--a2)}
+.rdlg-btn-sec{background:var(--bg3);border:1px solid var(--bd2);color:var(--t2);padding:9px;border-radius:9px;font-family:'Tajawal',sans-serif;font-size:13px;cursor:pointer;transition:all .15s;display:flex;align-items:center;justify-content:center;gap:6px}
+.rdlg-btn-sec:hover{border-color:var(--bd);color:var(--t)}
 @keyframes fi{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
 .fi{animation:fi .22s ease forwards}
-@keyframes spin{to{transform:rotate(360deg)}}
-.sp{display:inline-block;width:13px;height:13px;border:2px solid rgba(57,211,135,.3);
-  border-top-color:var(--a3);border-radius:50%;animation:spin .7s linear infinite}
-.toast{position:fixed;bottom:105px;left:50%;transform:translateX(-50%);
-  background:var(--bg3);border:1px solid var(--a);border-radius:8px;padding:8px 16px;
-  font-size:13px;color:var(--a3);z-index:200;animation:fi .2s ease;
-  box-shadow:var(--sh);pointer-events:none;white-space:nowrap}
+@keyframes spin2{to{transform:rotate(360deg)}}
+.sp{display:inline-block;width:13px;height:13px;border:2px solid rgba(57,211,135,.3);border-top-color:var(--a3);border-radius:50%;animation:spin2 .7s linear infinite}
+.toast{position:fixed;bottom:105px;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--a);border-radius:8px;padding:8px 16px;font-size:13px;color:var(--a3);z-index:200;animation:fi .2s ease;box-shadow:var(--sh);pointer-events:none;white-space:nowrap}
+.loading-overlay{position:fixed;inset:0;background:rgba(13,17,23,.85);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:150;gap:12px;font-size:14px;color:var(--a3)}
 `;
 
-// ── App (without export) ───────────────────────────────────────────────────────
+// ── Page splitter (splits long text into pages of ~500 words) ─────────────────
+function splitPages(text, wordsPerPage=300) {
+  const words = text.split(/\s+/).filter(Boolean);
+  const pages = [];
+  for (let i=0; i<words.length; i+=wordsPerPage) {
+    pages.push(words.slice(i, i+wordsPerPage).join(' '));
+  }
+  return pages.length ? pages : [text];
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
 function App() {
-  const [view,       setView]       = useState("library");
-  const [books,      setBooks]      = useState(BOOKS);
-  const [book,       setBook]       = useState(BOOKS[0]);
-  const [ch,         setCh]         = useState(0);
-  const [filter,     setFilter]     = useState("الكل");
-  const [speed,      setSpeed]      = useState(1.5);
-  const [prog,       setProg]       = useState(34);
-  const [showAdd,    setShowAdd]    = useState(false);
-  const [addTab,     setAddTab]     = useState("pdf");
-  const [urlIn,      setUrlIn]      = useState("");
-  const [txtIn,      setTxtIn]      = useState("");
-  const [aiTab,      setAiTab]      = useState("summary");
-  const [msgs,       setMsgs]       = useState([]);
-  const [aiIn,       setAiIn]       = useState("");
-  const [aiLoad,     setAiLoad]     = useState(false);
-  const [sq,         setSq]         = useState("");
-  const [gsq,        setGsq]        = useState("");
-  const [hovW,       setHovW]       = useState(null);
-  const [dsq,        setDsq]        = useState("");
-  const [bkm,        setBkm]        = useState(false);
-  const [voice,      setVoice]      = useState(VOICES[0]);
-  const [testV,      setTestV]      = useState(null);
-  const [ttsOn,      setTtsOn]      = useState(false);
-  const [hiIdx,      setHiIdx]      = useState(-1);
-  const [ocrImg,     setOcrImg]     = useState(null);
-  const [ocrUrl,     setOcrUrl]     = useState(null);
-  const [ocrRes,     setOcrRes]     = useState("");
-  const [ocrLoad,    setOcrLoad]    = useState(false);
-  const [showKey,    setShowKey]    = useState(false);
-  const [keyIn,      setKeyIn]      = useState("");
-  const [hasKey,     setHasKey]     = useState(false);
-  const [toast,      setToast]      = useState("");
+  const [view,      setView]      = useState("library");
+  const [books,     setBooks]     = useState(() => {
+    const saved = LS.get('qaree_books', null);
+    return saved || DEFAULT_BOOKS;
+  });
+  const [book,      setBook]      = useState(null);
+  const [ch,        setCh]        = useState(0);
+  const [pageIdx,   setPageIdx]   = useState(0);
+  const [filter,    setFilter]    = useState("الكل");
+  const [speed,     setSpeed]     = useState(1.5);
+  const [prog,      setProg]      = useState(0);
+  const [showAdd,   setShowAdd]   = useState(false);
+  const [addTab,    setAddTab]    = useState("pdf");
+  const [urlIn,     setUrlIn]     = useState("");
+  const [txtIn,     setTxtIn]     = useState("");
+  const [addTitle,  setAddTitle]  = useState("");
+  const [aiTab,     setAiTab]     = useState("summary");
+  const [msgs,      setMsgs]      = useState([]);
+  const [aiIn,      setAiIn]      = useState("");
+  const [aiLoad,    setAiLoad]    = useState(false);
+  const [sq,        setSq]        = useState("");
+  const [gsq,       setGsq]       = useState("");
+  const [hovW,      setHovW]      = useState(null);
+  const [dsq,       setDsq]       = useState("");
+  const [bkm,       setBkm]       = useState(false);
+  const [voice,     setVoice]     = useState(VOICES[0]);
+  const [testV,     setTestV]     = useState(null);
+  const [ttsOn,     setTtsOn]     = useState(false);
+  const [hiIdx,     setHiIdx]     = useState(-1);
+  const [ocrImg,    setOcrImg]    = useState(null);
+  const [ocrUrl,    setOcrUrl]    = useState(null);
+  const [ocrRes,    setOcrRes]    = useState("");
+  const [ocrLoad,   setOcrLoad]   = useState(false);
+  const [showKey,   setShowKey]   = useState(false);
+  const [keyIn,     setKeyIn]     = useState(LS.get('qaree_api_key',''));
+  const [hasKey,    setHasKey]    = useState(!!LS.get('qaree_api_key',''));
+  const [toast,     setToast]     = useState("");
+  const [loading,   setLoading]   = useState(false);
+  const [loadMsg,   setLoadMsg]   = useState("");
+  const [addErr,    setAddErr]    = useState("");
+  const [fileInput, setFileInput] = useState(null);
+  const [resumeDlg, setResumeDlg] = useState(null); // {book, saved} — نافذة الاستئناف
 
   const aiRef  = useRef(null);
   const ocrRef = useRef(null);
   const dropRef= useRef(null);
+  const pdfRef = useRef(null);
 
-  const showT = (msg) => { setToast(msg); setTimeout(()=>setToast(""),2600); };
+  // Save books to localStorage whenever they change
+  useEffect(()=>{ LS.set('qaree_books', books); }, [books]);
+
+  const showT = (msg) => { setToast(msg); setTimeout(()=>setToast(""),2800); };
 
   useEffect(()=>{ if(aiRef.current) aiRef.current.scrollTop=aiRef.current.scrollHeight; },[msgs]);
-  useEffect(()=>{ tts.stop(); setTtsOn(false); setHiIdx(-1); },[book]);
+  useEffect(()=>{ tts.stop(); setTtsOn(false); setHiIdx(-1); setPageIdx(0); },[book]);
+
+  // Current page text
+  const pages = useMemo(()=>{
+    if (!book) return [""];
+    return splitPages(book.excerpt || "");
+  }, [book]);
+
+  const currentPageText = pages[pageIdx] || "";
+  const totalPages = pages.length;
 
   const filtered = books.filter(b=>
     (filter==="الكل"||b.type===filter) &&
@@ -472,32 +528,61 @@ function App() {
   );
 
   const sresults = sq.length>1 && book
-    ? [{loc:"مقتطف",text:book.excerpt},{loc:"ملخص",text:book.summary}].flatMap(({loc,text})=>{
-        const i=text.indexOf(sq); if(i<0) return [];
-        const s=Math.max(0,i-35),e=Math.min(text.length,i+sq.length+35);
-        return [{loc,snippet:text.slice(s,e)}];
+    ? [{loc:"النص الكامل",text:book.excerpt||""}].flatMap(({loc,text})=>{
+        const results = [];
+        let idx = 0;
+        while(true) {
+          const i = text.indexOf(sq, idx);
+          if (i<0) break;
+          const s=Math.max(0,i-40), e=Math.min(text.length,i+sq.length+40);
+          results.push({loc:`${loc} — موضع ${results.length+1}`, snippet:text.slice(s,e)});
+          idx = i+1;
+          if (results.length>=5) break;
+        }
+        return results;
       })
     : [];
 
   const fmtT=(p)=>{ const t=Math.round((p/100)*42*60); return `${Math.floor(t/60)}:${(t%60).toString().padStart(2,"0")}`; };
 
-  // ── Claude ──────────────────────────────────────────────────────────────────
+  // ── Read book ───────────────────────────────────────────────────────────────
+  const openBook = (b) => {
+    const saved = LS.get(`qaree_prog_${b.id}`, null);
+    // إذا يوجد تقدم سابق وليس في البداية — اعرض نافذة الاختيار
+    if (saved && (saved.page > 0 || saved.ch > 0)) {
+      setResumeDlg({ book: b, saved });
+    } else {
+      startBook(b, 0, 0, 0);
+    }
+  };
+
+  const startBook = (b, chIdx, pgIdx, prg) => {
+    setBook(b); setCh(chIdx); setPageIdx(pgIdx); setProg(prg);
+    setView("reader"); setMsgs([]); setResumeDlg(null);
+  };
+
+  const saveProgress = useCallback((bookId, chIdx, pgIdx, prg) => {
+    LS.set(`qaree_prog_${bookId}`, {ch:chIdx, page:pgIdx, prog:prg});
+    setBooks(bs=>bs.map(b=>b.id===bookId?{...b,progress:Math.round(prg)}:b));
+  }, []);
+
+  // ── Claude AI ───────────────────────────────────────────────────────────────
   const runAI = useCallback(async(prompt)=>{
     if (!hasKey){setShowKey(true);return;}
     setAiLoad(true);
     setMsgs(m=>[...m,{r:"user",t:prompt},{r:"bot",t:""}]);
-    const sys=`أنت مساعد قراءة ذكي للكتب العربية. الكتاب الحالي: "${book?.title}" للمؤلف ${book?.author}. الفصل: ${book?.chapters[ch]}. أجب بالعربية الفصحى بشكل مختصر ومفيد.`;
+    const sys=`أنت مساعد قراءة ذكي للكتب العربية. الكتاب الحالي: "${book?.title}" للمؤلف ${book?.author}. الفصل: ${book?.chapters?.[ch]||"غير محدد"}. النص الحالي: "${currentPageText.slice(0,300)}...". أجب بالعربية الفصحى بشكل مختصر ومفيد.`;
     try {
       await callClaude(sys,prompt,(text)=>{
         setMsgs(m=>{const u=[...m];u[u.length-1]={r:"bot",t:text};return u;});
       });
     } catch(e){
-      const em=e.message==="NO_KEY"?"أدخل مفتاح API أولاً":e.message==="INVALID_KEY"?"مفتاح غير صحيح":"خطأ في الاتصال";
+      const em=e.message==="NO_KEY"?"أدخل مفتاح API أولاً":e.message==="INVALID_KEY"?"مفتاح API غير صحيح":"خطأ في الاتصال";
       setMsgs(m=>{const u=[...m];u[u.length-1]={r:"bot",t:em};return u;});
       if(e.message==="NO_KEY"||e.message==="INVALID_KEY") setShowKey(true);
     }
     setAiLoad(false);
-  },[book,ch,hasKey]);
+  },[book,ch,hasKey,currentPageText]);
 
   const qAI=(prompt)=>{ setAiTab("chat"); runAI(prompt); };
 
@@ -516,11 +601,10 @@ function App() {
     try {
       const res=await fetch("https://api.anthropic.com/v1/messages",{
         method:"POST",
-        headers:{"Content-Type":"application/json","x-api-key":getKey(),
-          "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+        headers:{"Content-Type":"application/json","x-api-key":getKey(),"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
         body:JSON.stringify({
-          model:"claude-sonnet-4-20250514",max_tokens:1500,
-          system:"أنت نظام OCR متخصص بالعربية. استخرج النص من الصورة بدقة تامة مع الحفاظ على الفقرات. أعطِ النص فقط بلا تعليقات.",
+          model:"claude-sonnet-4-20250514",max_tokens:2000,
+          system:"أنت نظام OCR متخصص بالعربية. استخرج النص من الصورة بدقة تامة. أعطِ النص فقط بلا تعليقات.",
           messages:[{role:"user",content:[
             {type:"image",source:{type:"base64",media_type:"image/jpeg",data:ocrImg}},
             {type:"text",text:"استخرج النص العربي من هذه الصورة."}
@@ -533,9 +617,7 @@ function App() {
       while(true){
         const{done,value}=await rdr.read(); if(done) break;
         for(const ln of dec.decode(value).split("\n").filter(l=>l.startsWith("data:"))){
-          try{ const j=JSON.parse(ln.slice(5));
-            if(j.type==="content_block_delta"&&j.delta?.text){full+=j.delta.text;setOcrRes(full);}
-          }catch{}
+          try{ const j=JSON.parse(ln.slice(5)); if(j.type==="content_block_delta"&&j.delta?.text){full+=j.delta.text;setOcrRes(full);} }catch{}
         }
       }
       showT("✓ تم استخراج النص بنجاح");
@@ -545,24 +627,119 @@ function App() {
 
   const addOCRBook=()=>{
     if(!ocrRes) return;
-    const nb={id:books.length+1,title:"كتاب مُمسوح ضوئياً",author:"—",type:"متنوع",
+    const nb={id:Date.now(),title:"كتاب مُمسوح ضوئياً",author:"—",type:"متنوع",
       progress:0,color:"#2a3a2a",icon:"📷",
-      chapters:["النص الكامل"],summary:"نص مستخرج بالمسح الضوئي.",excerpt:ocrRes.slice(0,500)};
-    setBooks(b=>[...b,nb]); setBook(nb); setView("reader");
+      chapters:["النص الكامل"],summary:"نص مستخرج بالمسح الضوئي.",excerpt:ocrRes,pages:1};
+    setBooks(b=>[...b,nb]); openBook(nb);
     showT("✓ أُضيف الكتاب إلى مكتبتك");
+  };
+
+  // ── PDF Upload (real) ────────────────────────────────────────────────────────
+  const handlePDFFile = async (file) => {
+    if (!file) return;
+    setAddErr("");
+    const isPDF = file.type==="application/pdf" || file.name.endsWith(".pdf");
+    const isTXT = file.type==="text/plain" || file.name.endsWith(".txt");
+
+    setLoading(true);
+    setLoadMsg("جارٍ قراءة الملف...");
+
+    try {
+      let text="", pages=1, chapters=[];
+
+      if (isPDF && window.pdfjsLib) {
+        setLoadMsg("جارٍ استخراج النص من PDF...");
+        const result = await extractPDFText(file);
+        text = result.text;
+        pages = result.pages;
+        chapters = result.chapters.length ? result.chapters : ["الفصل الأول"];
+      } else if (isTXT) {
+        text = await file.text();
+        chapters = ["النص الكامل"];
+        pages = Math.ceil(text.split(/\s+/).length / 300);
+      } else {
+        // Try reading as text anyway
+        text = await file.text();
+        chapters = ["النص الكامل"];
+      }
+
+      if (!text.trim()) { setAddErr("لم يتم استخراج نص من الملف"); setLoading(false); return; }
+
+      const nb = {
+        id: Date.now(),
+        title: addTitle || file.name.replace(/\.[^/.]+$/,""),
+        author:"—", type:"متنوع", progress:0,
+        color:"#2a2a4a", icon:"📄",
+        chapters, summary:`كتاب مرفوع — ${pages} صفحة`,
+        excerpt: text, pages,
+      };
+      setBooks(b=>[...b,nb]);
+      setShowAdd(false); setAddTitle("");
+      openBook(nb);
+      showT("✓ تم رفع الكتاب بنجاح");
+    } catch(e) {
+      setAddErr("حدث خطأ أثناء قراءة الملف: "+e.message);
+    }
+    setLoading(false);
+  };
+
+  // ── URL Fetch ────────────────────────────────────────────────────────────────
+  const handleURL = async () => {
+    if (!urlIn.trim()) return;
+    setAddErr("");
+    setLoading(true);
+    setLoadMsg("جارٍ جلب المحتوى من الرابط...");
+    try {
+      const text = await fetchURL(urlIn.trim());
+      if (!text || text.length < 100) { setAddErr("لم يتم استخراج محتوى كافٍ من الرابط"); setLoading(false); return; }
+      const nb = {
+        id: Date.now(),
+        title: addTitle || new URL(urlIn).hostname,
+        author:"من الويب", type:"متنوع", progress:0,
+        color:"#1a2a4a", icon:"🌐",
+        chapters:["المحتوى الكامل"],
+        summary:`محتوى مجلوب من: ${urlIn.slice(0,60)}`,
+        excerpt: text, pages: Math.ceil(text.split(/\s+/).length/300),
+      };
+      setBooks(b=>[...b,nb]);
+      setShowAdd(false); setUrlIn(""); setAddTitle("");
+      openBook(nb);
+      showT("✓ تم جلب المحتوى بنجاح");
+    } catch(e) {
+      setAddErr("فشل في جلب الرابط. تأكد من صحة الرابط أو جرّب نسخ النص يدوياً.");
+    }
+    setLoading(false);
   };
 
   // ── TTS ─────────────────────────────────────────────────────────────────────
   const doTTS=()=>{
     if(ttsOn){ if(tts.paused) tts.resume(); else tts.pause(); return; }
-    const text=book?.excerpt||""; if(!text) return;
+    const text=currentPageText; if(!text) return;
     const words=text.split(" ");
     const map=[]; let c=0;
     words.forEach(w=>{ map.push(c); c+=w.length+1; });
     setTtsOn(true); setHiIdx(0);
-    const ok=tts.speak(text,voice,speed,
+    const ok=tts.speak(text, voice, speed,
       (ci)=>{ const wi=map.reduce((p,v,i)=>v<=ci?i:p,0); setHiIdx(wi); },
-      ()=>{ setTtsOn(false); setHiIdx(-1); }
+      ()=>{
+        setTtsOn(false); setHiIdx(-1);
+        // Auto advance to next page
+        if (pageIdx < totalPages-1) {
+          const np=pageIdx+1;
+          const newProg=Math.min(99,Math.round(((ch*totalPages+np)/((book?.chapters?.length||1)*totalPages))*100));
+          setTimeout(()=>{ setPageIdx(np); if(book) saveProgress(book.id,ch,np,newProg); }, 600);
+          showT("▶ الصفحة التالية");
+        } else if (ch < (book?.chapters?.length||1)-1) {
+          const nc=ch+1;
+          const newProg=Math.min(99,Math.round((nc/(book?.chapters?.length||1))*100));
+          setTimeout(()=>{ setCh(nc); setPageIdx(0); if(book) saveProgress(book.id,nc,0,newProg); }, 600);
+          showT("▶ الفصل التالي");
+        } else {
+          // أكمل الكتاب
+          if(book) saveProgress(book.id, ch, pageIdx, 100);
+          showT("🎉 أكملت هذا الكتاب!");
+        }
+      }
     );
     if(!ok) showT("المتصفح لا يدعم الصوت العربي — جرّب Chrome");
   };
@@ -574,10 +751,47 @@ function App() {
     tts.speak("مرحباً، هذا اختبار للصوت العربي.",cfg,1,null,()=>setTestV(null));
   };
 
-  // ── Save key ────────────────────────────────────────────────────────────────
+  // ── Page navigation ──────────────────────────────────────────────────────────
+  const goNextPage=()=>{
+    stopTTS();
+    if(pageIdx<totalPages-1){
+      const np=pageIdx+1;
+      setPageIdx(np);
+      const newProg = Math.min(99, Math.round(((ch*totalPages+np)/((book?.chapters?.length||1)*totalPages))*100));
+      if(book) saveProgress(book.id, ch, np, newProg);
+    } else if(ch<(book?.chapters?.length||1)-1){
+      const nc=ch+1;
+      setCh(nc); setPageIdx(0);
+      const newProg = Math.min(99, Math.round((nc/(book?.chapters?.length||1))*100));
+      if(book) saveProgress(book.id, nc, 0, newProg);
+    }
+  };
+  const goPrevPage=()=>{
+    stopTTS();
+    if(pageIdx>0){
+      const np=pageIdx-1;
+      setPageIdx(np);
+      if(book) saveProgress(book.id, ch, np, prog);
+    } else if(ch>0){
+      const nc=ch-1;
+      setCh(nc); setPageIdx(0);
+      if(book) saveProgress(book.id, nc, 0, prog);
+    }
+  };
+
+  // ── Save Key ─────────────────────────────────────────────────────────────────
   const saveKey=()=>{
     if(!keyIn.trim().startsWith("sk-ant-")){showT("❌ المفتاح يجب أن يبدأ بـ sk-ant-");return;}
-    setKey(keyIn.trim()); setHasKey(true); setShowKey(false); showT("✓ تم حفظ مفتاح API");
+    saveApiKey(keyIn.trim()); setHasKey(true); setShowKey(false); showT("✓ تم حفظ مفتاح API");
+  };
+
+  const deleteBook=(id,e)=>{
+    e.stopPropagation();
+    if(!window.confirm("حذف هذا الكتاب من المكتبة؟")) return;
+    setBooks(bs=>bs.filter(b=>b.id!==id));
+    LS.del(`qaree_prog_${id}`);
+    if(book?.id===id){ setBook(null); setView("library"); }
+    showT("تم حذف الكتاب");
   };
 
   const types=["الكل",...new Set(books.map(b=>b.type))];
@@ -586,18 +800,22 @@ function App() {
     <>
       <style>{CSS}</style>
       {toast && <div className="toast">{toast}</div>}
+      {loading && (
+        <div className="loading-overlay">
+          <div className="sp" style={{width:32,height:32,borderWidth:3}}/>
+          <div>{loadMsg}</div>
+        </div>
+      )}
 
       <div className="shell">
 
-        {/* ── NAV ── */}
+        {/* NAV */}
         <nav className="nav">
           <div className="logo"><div className="lm">ق</div> قارئ</div>
-
           <div className="nsearch">
             <span className="si"><Ic n="search" s={13}/></span>
             <input placeholder="ابحث في مكتبتك..." value={gsq} onChange={e=>setGsq(e.target.value)}/>
           </div>
-
           <div className="ntabs">
             {["library","reader","stats"].map((v,i)=>(
               <button key={v} className={`ntab${view===v?" on":""}`} onClick={()=>setView(v)}>
@@ -605,17 +823,15 @@ function App() {
               </button>
             ))}
           </div>
-
           <button className={`kbtn${hasKey?" on":""}`} onClick={()=>setShowKey(true)}>
             <Ic n="key" s={13}/> {hasKey?"API ✓":"أدخل API Key"}
           </button>
-
-          <button className="abtn" onClick={()=>setShowAdd(true)}>
+          <button className="abtn" onClick={()=>{setShowAdd(true);setAddErr("");}}>
             <Ic n="upload" s={13}/> إضافة كتاب
           </button>
         </nav>
 
-        {/* ── SIDEBAR ── */}
+        {/* SIDEBAR */}
         <aside className="sb">
           <div className="sbs">التصنيفات</div>
           {[{l:"جميع الكتب",i:"📚",k:"الكل"},{l:"أقرأ الآن",i:"▷",k:"reading"},{l:"مكتملة",i:"✓",k:"done"}].map(x=>(
@@ -625,7 +841,7 @@ function App() {
             </div>
           ))}
           <div className="sbs">الأنواع</div>
-          {[["روايات","📖"],["تطوير ذاتي","🧠"],["تاريخ","🏛"],["تراث","📜"]].map(([l,i])=>(
+          {[["روايات","📖"],["تطوير ذاتي","🧠"],["تاريخ","🏛"],["تراث","📜"],["متنوع","📄"]].map(([l,i])=>(
             <div key={l} className={`sbi${filter===l?" on":""}`} onClick={()=>setFilter(l)}>
               <span>{i}</span>{l}
             </div>
@@ -642,7 +858,7 @@ function App() {
           </div>
         </aside>
 
-        {/* ── MAIN ── */}
+        {/* MAIN */}
         <main className="main">
 
           {/* LIBRARY */}
@@ -652,108 +868,107 @@ function App() {
                 <div className="sh"><span className="st">استمر في القراءة</span></div>
                 <div className="bgrid" style={{marginBottom:20}}>
                   {books.filter(b=>b.progress>0&&b.progress<100).map(b=>(
-                    <Bcard key={b.id} b={b} sel={book?.id===b.id} onClick={()=>{setBook(b);setView("reader");}}/>
+                    <Bcard key={b.id} b={b} sel={book?.id===b.id} onClick={()=>openBook(b)} onDel={(e)=>deleteBook(b.id,e)}/>
                   ))}
                 </div>
               </>}
               <div className="sh"><span className="st">كل الكتب</span></div>
               <div className="frow">{types.map(t=><button key={t} className={`fp${filter===t?" on":""}`} onClick={()=>setFilter(t)}>{t}</button>)}</div>
-              <div className="bgrid">{filtered.map(b=><Bcard key={b.id} b={b} sel={book?.id===b.id} onClick={()=>{setBook(b);setView("reader");}}/>)}</div>
+              <div className="bgrid">
+                {filtered.map(b=><Bcard key={b.id} b={b} sel={book?.id===b.id} onClick={()=>openBook(b)} onDel={(e)=>deleteBook(b.id,e)}/>)}
+              </div>
             </div>
           )}
 
           {/* READER */}
-          {view==="reader"&&book&&(
+          {view==="reader"&&(
             <div className="fi">
-              {/* Header */}
-              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:13}}>
-                <span style={{fontSize:24}}>{book.icon}</span>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:16,fontWeight:700,fontFamily:"'Amiri',serif"}}>{book.title}</div>
-                  <div style={{fontSize:12,color:"var(--t3)"}}>{book.author} · الفصل {ch+1}: {book.chapters[ch]}</div>
+              {!book ? (
+                <div style={{textAlign:"center",padding:"60px 20px",color:"var(--t3)"}}>
+                  <div style={{fontSize:36,marginBottom:12}}>📚</div>
+                  <div style={{fontSize:14}}>اختر كتاباً من المكتبة للبدء</div>
+                  <button className="abtn" style={{margin:"16px auto",display:"inline-flex"}} onClick={()=>setView("library")}>اذهب إلى المكتبة</button>
                 </div>
-                {/* TTS buttons */}
-                <div style={{display:"flex",gap:6}}>
-                  <button onClick={doTTS} style={{
-                    display:"flex",alignItems:"center",gap:5,padding:"6px 12px",fontSize:12,
-                    background:ttsOn?"rgba(124,58,237,.18)":"rgba(46,168,110,.1)",
-                    border:`1px solid ${ttsOn?"var(--purple)":"var(--a)"}`,borderRadius:8,
-                    cursor:"pointer",color:ttsOn?"#a78bfa":"var(--a3)",fontFamily:"'Tajawal',sans-serif",
-                    transition:"all .2s"
-                  }}>
-                    <Ic n={ttsOn?"pause":"voice"} s={13}/>
-                    {ttsOn?"إيقاف مؤقت":"استمع الآن"}
+              ) : <>
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:13}}>
+                  <span style={{fontSize:24}}>{book.icon}</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:16,fontWeight:700,fontFamily:"'Amiri',serif"}}>{book.title}</div>
+                    <div style={{fontSize:12,color:"var(--t3)"}}>
+                      {book.author} · الفصل {ch+1} · صفحة {pageIdx+1}/{totalPages}
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:6}}>
+                    <button onClick={doTTS} style={{
+                      display:"flex",alignItems:"center",gap:5,padding:"6px 12px",fontSize:12,
+                      background:ttsOn?"rgba(124,58,237,.18)":"rgba(46,168,110,.1)",
+                      border:`1px solid ${ttsOn?"var(--purple)":"var(--a)"}`,borderRadius:8,
+                      cursor:"pointer",color:ttsOn?"#a78bfa":"var(--a3)",fontFamily:"'Tajawal',sans-serif"}}>
+                      <Ic n={ttsOn?"pause":"voice"} s={13}/>
+                      {ttsOn?"إيقاف مؤقت":"استمع"}
+                    </button>
+                    {ttsOn&&<button onClick={stopTTS} style={{padding:"6px 11px",fontSize:12,background:"rgba(224,92,92,.1)",border:"1px solid var(--red)",borderRadius:8,cursor:"pointer",color:"var(--red)",fontFamily:"'Tajawal',sans-serif"}}>■</button>}
+                  </div>
+                </div>
+
+                {/* Search */}
+                <div style={{position:"relative",marginBottom:13}}>
+                  <span style={{position:"absolute",right:9,top:"50%",transform:"translateY(-50%)",color:"var(--t3)"}}><Ic n="search" s={13}/></span>
+                  <input className="mi" style={{paddingRight:28,paddingLeft:10}} placeholder="ابحث في النص..." value={sq} onChange={e=>setSq(e.target.value)}/>
+                </div>
+
+                {sq.length>1&&(
+                  <div style={{marginBottom:13}}>
+                    <div className="st" style={{marginBottom:8}}>نتائج "{sq}" ({sresults.length})</div>
+                    {sresults.length===0
+                      ? <div style={{color:"var(--t3)",fontSize:13}}>لا توجد نتائج</div>
+                      : sresults.map((r,i)=>(
+                          <div key={i} className="sres">
+                            <div className="sloc">📍 {r.loc}</div>
+                            <div dangerouslySetInnerHTML={{__html:r.snippet.replace(new RegExp(sq.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),"g"),`<mark>${sq}</mark>`)}}/>
+                          </div>
+                        ))
+                    }
+                  </div>
+                )}
+
+                {/* Book text */}
+                <div style={{background:"var(--bg2)",border:"1px solid var(--bd)",borderRadius:12,padding:18,fontFamily:"'Amiri',serif",fontSize:17,lineHeight:2.1,color:"var(--t)",marginBottom:6,direction:"rtl",minHeight:130}}>
+                  {currentPageText.split(" ").map((word,i)=>{
+                    const clean=word.replace(/[،.!؟:؛]/g,"");
+                    const def=DICT[clean];
+                    const isHi=ttsOn&&hiIdx===i;
+                    return def?(
+                      <span key={i} style={{position:"relative",display:"inline"}} onMouseEnter={()=>setHovW(clean)} onMouseLeave={()=>setHovW(null)}>
+                        <span className={`wh ttsw${isHi?" hi":""}`}>{word} </span>
+                        {hovW===clean&&(
+                          <span className="wtt">
+                            <div style={{color:"var(--gold)",fontFamily:"'Amiri',serif",fontSize:15,marginBottom:3}}>{clean}</div>
+                            {def}
+                          </span>
+                        )}
+                      </span>
+                    ):(
+                      <span key={i} className={`ttsw${isHi?" hi":""}`}>{word} </span>
+                    );
+                  })}
+                </div>
+
+                {/* Page navigation */}
+                <div className="page-nav">
+                  <button className="pnbtn" disabled={pageIdx===0&&ch===0} onClick={goPrevPage}>◀ السابقة</button>
+                  <span style={{fontSize:12,color:"var(--t3)"}}>صفحة {pageIdx+1} من {totalPages}</span>
+                  <button className="pnbtn" disabled={pageIdx===totalPages-1&&ch===(book.chapters.length-1)} onClick={goNextPage}>التالية ▶</button>
+                </div>
+
+                {/* Bookmark */}
+                <div style={{display:"flex",gap:6,marginTop:8}}>
+                  <button onClick={()=>{setBkm(true);setTimeout(()=>setBkm(false),2200);if(book)saveProgress(book.id,ch,pageIdx,prog);showT("✓ إشارة مرجعية محفوظة");}}
+                    style={{display:"flex",alignItems:"center",gap:6,padding:"6px 13px",background:bkm?"rgba(46,168,110,.16)":"var(--bg3)",border:`1px solid ${bkm?"var(--a)":"var(--bd)"}`,borderRadius:8,color:bkm?"var(--a3)":"var(--t2)",cursor:"pointer",fontSize:13,fontFamily:"'Tajawal',sans-serif",transition:"all .2s"}}>
+                    <Ic n={bkm?"check":"bkmk"} s={13}/>{bkm?"محفوظة!":"حفظ الموضع"}
                   </button>
-                  {ttsOn&&(
-                    <button onClick={stopTTS} style={{
-                      padding:"6px 11px",fontSize:12,background:"rgba(224,92,92,.1)",
-                      border:"1px solid var(--red)",borderRadius:8,cursor:"pointer",
-                      color:"var(--red)",fontFamily:"'Tajawal',sans-serif"
-                    }}>■ إيقاف</button>
-                  )}
                 </div>
-              </div>
-
-              {/* In-book search */}
-              <div style={{position:"relative",marginBottom:13}}>
-                <span style={{position:"absolute",right:9,top:"50%",transform:"translateY(-50%)",color:"var(--t3)"}}><Ic n="search" s={13}/></span>
-                <input className="mi" style={{paddingRight:28,paddingLeft:10}}
-                  placeholder="ابحث داخل الكتاب..." value={sq} onChange={e=>setSq(e.target.value)}/>
-              </div>
-
-              {sq.length>1&&(
-                <div style={{marginBottom:13}}>
-                  <div className="st" style={{marginBottom:8}}>نتائج "{sq}"</div>
-                  {sresults.length===0
-                    ? <div style={{color:"var(--t3)",fontSize:13}}>لا توجد نتائج</div>
-                    : sresults.map((r,i)=>(
-                        <div key={i} className="sres">
-                          <div className="sloc">📍 {r.loc}</div>
-                          <div dangerouslySetInnerHTML={{__html:r.snippet.replace(new RegExp(sq,"g"),`<mark>${sq}</mark>`)}}/>
-                        </div>
-                      ))
-                  }
-                </div>
-              )}
-
-              {/* Book text */}
-              <div style={{background:"var(--bg2)",border:"1px solid var(--bd)",borderRadius:12,
-                padding:18,fontFamily:"'Amiri',serif",fontSize:17,lineHeight:2.1,
-                color:"var(--t)",marginBottom:13,direction:"rtl",minHeight:130}}>
-                <div style={{color:"var(--t3)",fontSize:11,marginBottom:9,fontFamily:"'Tajawal',sans-serif"}}>
-                  الفصل {ch+1}: {book.chapters[ch]}
-                </div>
-                {book.excerpt.split(" ").map((word,i)=>{
-                  const clean=word.replace(/[،.!؟:]/g,"");
-                  const def=DICT[clean];
-                  const isHi=ttsOn&&hiIdx===i;
-                  return def?(
-                    <span key={i} style={{position:"relative",display:"inline"}}
-                      onMouseEnter={()=>setHovW(clean)} onMouseLeave={()=>setHovW(null)}>
-                      <span className={`wh ttsw${isHi?" hi":""}`}>{word} </span>
-                      {hovW===clean&&(
-                        <span className="wtt">
-                          <div style={{color:"var(--gold)",fontFamily:"'Amiri',serif",fontSize:15,marginBottom:3}}>{clean}</div>
-                          {def}
-                        </span>
-                      )}
-                    </span>
-                  ):(
-                    <span key={i} className={`ttsw${isHi?" hi":""}`}>{word} </span>
-                  );
-                })}
-              </div>
-
-              {/* Bookmark */}
-              <button onClick={()=>{setBkm(true);setTimeout(()=>setBkm(false),2200);showT("✓ إشارة مرجعية محفوظة");}}
-                style={{display:"flex",alignItems:"center",gap:6,padding:"6px 13px",
-                  background:bkm?"rgba(46,168,110,.16)":"var(--bg3)",
-                  border:`1px solid ${bkm?"var(--a)":"var(--bd)"}`,borderRadius:8,
-                  color:bkm?"var(--a3)":"var(--t2)",cursor:"pointer",fontSize:13,
-                  fontFamily:"'Tajawal',sans-serif",transition:"all .2s"}}>
-                <Ic n={bkm?"check":"bkmk"} s={13}/>
-                {bkm?"محفوظة!":"إشارة مرجعية"}
-              </button>
+              </>}
             </div>
           )}
 
@@ -762,49 +977,51 @@ function App() {
             <div className="fi">
               <div className="sh"><span className="st">إحصائياتي</span></div>
               <div className="sgrid">
-                {[["14.2","ساعات الاستماع","var(--a3)"],["4","كتب مكتملة","#a78bfa"],
-                  ["1.8×","متوسط السرعة","var(--gold)"],["92%","نسبة الإكمال","#f87171"]]
-                  .map(([v,l,c])=><div key={l} className="sbox"><div className="sv" style={{color:c}}>{v}</div><div className="sl">{l}</div></div>)}
+                {[
+                  [books.length+"","إجمالي الكتب","var(--a3)"],
+                  [books.filter(b=>b.progress===100).length+"","كتب مكتملة","#a78bfa"],
+                  [speed+"×","متوسط السرعة","var(--gold)"],
+                  [books.filter(b=>b.progress>0).length+"","كتب بدأتها","#f87171"]
+                ].map(([v,l,c])=><div key={l} className="sbox"><div className="sv" style={{color:c}}>{v}</div><div className="sl">{l}</div></div>)}
               </div>
               <div style={{background:"var(--bg2)",border:"1px solid var(--bd)",borderRadius:12,padding:14,marginBottom:14}}>
-                <div className="st" style={{marginBottom:10}}>نشاط الأسبوع</div>
-                <div className="barch">
-                  {["س","أح","إث","ث","أر","خ","ج"].map((d,i)=>{
-                    const h=[20,55,40,80,60,75,35][i];
-                    return <div key={d} className="barcol"><div className={`barf${i===3?" today":""}`} style={{height:`${h}%`}}/><div className="bard">{d}</div></div>;
-                  })}
-                </div>
-              </div>
-              <div style={{background:"var(--bg2)",border:"1px solid var(--bd)",borderRadius:12,padding:13}}>
-                <div className="st" style={{marginBottom:10}}>الكتب الأكثر قراءةً</div>
-                {books.slice(0,3).map((b,i)=>(
-                  <div key={b.id} style={{display:"flex",alignItems:"center",gap:9,padding:"7px 0",borderBottom:i<2?"1px solid var(--bd)":"none"}}>
-                    <span style={{fontSize:11,color:"var(--t3)",width:14,textAlign:"center"}}>{i+1}</span>
-                    <span style={{fontSize:17}}>{b.icon}</span>
-                    <div style={{flex:1}}><div style={{fontSize:13,fontWeight:700}}>{b.title}</div><div style={{fontSize:11,color:"var(--t3)"}}>{b.progress}% مكتمل</div></div>
-                    <Ic n="star" s={12}/>
+                <div className="st" style={{marginBottom:10}}>مستوى التقدم</div>
+                {books.slice(0,5).map((b,i)=>(
+                  <div key={b.id} style={{marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"var(--t2)",marginBottom:4}}>
+                      <span>{b.icon} {b.title}</span><span style={{color:"var(--a3)"}}>{b.progress}%</span>
+                    </div>
+                    <div style={{height:4,background:"var(--bd2)",borderRadius:2}}>
+                      <div style={{height:"100%",width:`${b.progress}%`,background:"var(--a)",borderRadius:2,transition:"width .4s"}}/>
+                    </div>
                   </div>
                 ))}
+              </div>
+              <div style={{background:"var(--bg2)",border:"1px solid var(--bd)",borderRadius:12,padding:13}}>
+                <div className="st" style={{marginBottom:8}}>معلومات التخزين</div>
+                <div style={{fontSize:12,color:"var(--t2)",lineHeight:1.8}}>
+                  📦 الكتب محفوظة محلياً في المتصفح<br/>
+                  🔄 تتزامن تلقائياً عند العودة للتطبيق<br/>
+                  💾 لا تحتاج إنترنت للقراءة بعد الرفع
+                </div>
               </div>
             </div>
           )}
         </main>
 
-        {/* ── AI PANEL ── */}
+        {/* AI PANEL */}
         <aside className="aip">
           <div className="aihead">
             <div className="dot"/>
             المساعد الذكي
-            {!hasKey&&<button onClick={()=>setShowKey(true)} style={{marginRight:"auto",fontSize:10,
-              padding:"2px 8px",background:"rgba(212,168,67,.1)",border:"1px solid var(--gold)",
-              borderRadius:5,color:"var(--gold)",cursor:"pointer",fontFamily:"'Tajawal',sans-serif"}}>
+            {!hasKey&&<button onClick={()=>setShowKey(true)} style={{marginRight:"auto",fontSize:10,padding:"2px 8px",background:"rgba(212,168,67,.1)",border:"1px solid var(--gold)",borderRadius:5,color:"var(--gold)",cursor:"pointer",fontFamily:"'Tajawal',sans-serif"}}>
               أدخل API Key ↗
             </button>}
           </div>
 
           <div className="aitabs">
             {[{id:"summary",l:"ملخص",i:"brain"},{id:"chapters",l:"فصول",i:"list"},
-              {id:"voices",l:"أصوات",i:"mic"},{id:"ocr",l:"مسح OCR",i:"scan"},
+              {id:"voices",l:"أصوات",i:"mic"},{id:"ocr",l:"مسح",i:"scan"},
               {id:"dict",l:"قاموس",i:"dict"},{id:"chat",l:"محادثة",i:"chat"}]
               .map(t=><button key={t.id} className={`aitab${aiTab===t.id?" on":""}`} onClick={()=>setAiTab(t.id)}>
                 <Ic n={t.i} s={11}/>{t.l}
@@ -812,18 +1029,19 @@ function App() {
           </div>
 
           <div className="aibody" ref={aiRef}>
-
-            {/* SUMMARY */}
             {aiTab==="summary"&&book&&<>
               <div className="aim"><strong>{book.title}</strong><br/>{book.summary}</div>
-              <div className="aim"><strong>الفصل ({ch+1}):</strong> {book.chapters[ch]}<br/><span style={{color:"var(--t3)",fontSize:12}}>تقدمك: {book.progress}%</span></div>
+              <div className="aim">
+                <strong>الفصل ({ch+1}):</strong> {book.chapters?.[ch]||"—"}<br/>
+                <strong>الصفحة:</strong> {pageIdx+1} من {totalPages}<br/>
+                <span style={{color:"var(--t3)",fontSize:12}}>التقدم: {book.progress}%</span>
+              </div>
             </>}
 
-            {/* CHAPTERS */}
             {aiTab==="chapters"&&book&&(
               <div style={{display:"flex",flexDirection:"column",gap:2}}>
-                {book.chapters.map((c,i)=>(
-                  <div key={i} className={`sbi${ch===i?" on":""}`} onClick={()=>setCh(i)}>
+                {(book.chapters||[]).map((c,i)=>(
+                  <div key={i} className={`sbi${ch===i?" on":""}`} onClick={()=>{setCh(i);setPageIdx(0);stopTTS();}}>
                     <span style={{fontSize:11,color:"var(--t3)",minWidth:18}}>{i+1}</span>{c}
                     {ch===i&&<span style={{marginRight:"auto",fontSize:10,color:"var(--a3)"}}>▶</span>}
                   </div>
@@ -831,69 +1049,50 @@ function App() {
               </div>
             )}
 
-            {/* VOICES */}
             {aiTab==="voices"&&<>
-              <div className="aim">اختر الصوت العربي المناسب للاستماع. اضغط "تجربة" للمعاينة.</div>
+              <div className="aim">اختر الصوت العربي وجرّبه قبل الاستماع.</div>
               {VOICES.map(cfg=>(
                 <div key={cfg.id} className={`vc${voice.id===cfg.id?" on":""}`} onClick={()=>setVoice(cfg)}>
-                  <div className="vavatar" style={{background:cfg.gender==="f"?"rgba(124,58,237,.2)":"rgba(46,168,110,.2)"}}>
-                    {cfg.gender==="f"?"👩":"👨"}
-                  </div>
+                  <div className="vavatar" style={{background:cfg.gender==="f"?"rgba(124,58,237,.2)":"rgba(46,168,110,.2)"}}>{cfg.gender==="f"?"👩":"👨"}</div>
                   <div><div className="vname">{cfg.label}</div><div className="vsub">{cfg.dialect} · {cfg.lang}</div></div>
                   <button className={`vtbtn${testV===cfg.id?" on":""}`} onClick={e=>{e.stopPropagation();testVoice(cfg);}}>
                     {testV===cfg.id?"■ إيقاف":"▶ تجربة"}
                   </button>
                 </div>
               ))}
-              <div className="aim" style={{fontSize:12,color:"var(--t3)"}}>
-                الصوت الحالي: <strong style={{color:"var(--a3)"}}>{voice.label} — {voice.dialect}</strong><br/>
-                جودة الصوت تعتمد على أصوات نظام التشغيل المثبتة.
-              </div>
             </>}
 
-            {/* OCR */}
             {aiTab==="ocr"&&<>
-              <div className="aim">📷 <strong>المسح الضوئي للكتب الورقية</strong><br/>
-                ارفع صورة من كتاب ورقي وسيستخرج الذكاء الاصطناعي النص العربي تلقائياً.</div>
+              <div className="aim">📷 <strong>المسح الضوئي</strong><br/>ارفع صورة كتاب ورقي وسيُستخرج النص تلقائياً.</div>
               {ocrUrl&&<img src={ocrUrl} className="oimg" alt="preview"/>}
-              <div className={`odrop`} ref={dropRef}
+              <div className="odrop" ref={dropRef}
                 onClick={()=>ocrRef.current?.click()}
-                onDragOver={e=>{e.preventDefault();dropRef.current?.classList.add("drag");}}
-                onDragLeave={()=>dropRef.current?.classList.remove("drag")}
-                onDrop={e=>{e.preventDefault();dropRef.current?.classList.remove("drag");loadOCRFile(e.dataTransfer.files[0]);}}>
+                onDragOver={e=>{e.preventDefault();}}
+                onDrop={e=>{e.preventDefault();loadOCRFile(e.dataTransfer.files[0]);}}>
                 <input ref={ocrRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>loadOCRFile(e.target.files[0])}/>
-                <div style={{fontSize:24,marginBottom:6,color:"var(--t3)"}}><Ic n="camera" s={24}/></div>
+                <div style={{fontSize:22,marginBottom:5,color:"var(--t3)"}}><Ic n="camera" s={22}/></div>
                 <div style={{fontSize:13,color:"var(--t2)",fontWeight:500}}>{ocrImg?"استبدل الصورة":"ارفع صورة الكتاب"}</div>
-                <div style={{fontSize:11,color:"var(--t3)",marginTop:3}}>JPG · PNG · WebP — اسحب وأفلت</div>
+                <div style={{fontSize:11,color:"var(--t3)",marginTop:3}}>JPG · PNG — اسحب وأفلت</div>
               </div>
-              {ocrImg&&(
-                <button className="msub" disabled={ocrLoad} onClick={runOCR}
-                  style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
-                  {ocrLoad?<><span className="sp"/>&nbsp;جارٍ الاستخراج...</>:"🔍 استخرج النص"}
-                </button>
-              )}
+              {ocrImg&&<button className="msub" disabled={ocrLoad} onClick={runOCR} style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+                {ocrLoad?<><span className="sp"/>&nbsp;جارٍ الاستخراج...</>:"🔍 استخرج النص"}
+              </button>}
               {ocrRes&&<>
                 <div className="ores">{ocrRes}</div>
-                <button className="msub" onClick={addOCRBook} style={{background:"var(--purple)"}}>
-                  ＋ أضف إلى المكتبة
-                </button>
+                <button className="msub" onClick={addOCRBook} style={{background:"var(--purple)"}}>＋ أضف إلى المكتبة</button>
               </>}
             </>}
 
-            {/* DICT */}
             {aiTab==="dict"&&<>
               <input className="mi" placeholder="ابحث عن كلمة..." value={dsq} onChange={e=>setDsq(e.target.value)} style={{marginBottom:4}}/>
               {Object.entries(DICT).filter(([w])=>dsq===""||w.includes(dsq)).map(([word,def])=>(
-                <div key={word} className="de">
-                  <div><div className="dw">{word}</div><div className="dd">{def}</div></div>
-                </div>
+                <div key={word} className="de"><div><div className="dw">{word}</div><div className="dd">{def}</div></div></div>
               ))}
             </>}
 
-            {/* CHAT */}
             {aiTab==="chat"&&<>
               {msgs.length===0&&<div className="aim">
-                مرحباً! اسألني عن <strong>{book?.title||"كتابك"}</strong>.
+                مرحباً! اسألني عن <strong>{book?.title||"الكتاب الذي تقرأه"}</strong>.
                 {!hasKey&&<><br/><span style={{color:"var(--gold)",fontSize:11}}>⚠ أدخل API Key أولاً</span></>}
               </div>}
               {msgs.map((m,i)=>(
@@ -903,68 +1102,61 @@ function App() {
                 </div>
               ))}
             </>}
-
           </div>
 
-          {/* Quick AI */}
           <div className="aiqrow">
-            <button className="aiq" onClick={()=>qAI(`لخّص الفصل الحالي من "${book?.title}" في 3 نقاط`)}>📝 ملخص الفصل</button>
+            <button className="aiq" onClick={()=>qAI(`لخّص هذا النص في 3 نقاط: "${currentPageText.slice(0,200)}"`)}>📝 ملخص الصفحة</button>
             <button className="aiq" onClick={()=>qAI(`ما الأفكار الرئيسية في "${book?.title}"؟`)}>💡 أفكار</button>
             <button className="aiq" onClick={()=>qAI(`اقترح كتباً مشابهة لـ "${book?.title}"`)}>📚 مشابهة</button>
-            <button className="aiq" onClick={()=>qAI(`اشرح أهم مصطلحات "${book?.title}"`)}>🔤 مصطلحات</button>
+            <button className="aiq" onClick={()=>qAI(`اشرح المصطلحات الصعبة في هذا النص: "${currentPageText.slice(0,200)}"`)}>🔤 مصطلحات</button>
           </div>
 
           {aiTab==="chat"&&(
             <div className="aiinrow">
               <input placeholder="اسأل عن الكتاب..." value={aiIn} onChange={e=>setAiIn(e.target.value)}
                 disabled={aiLoad} onKeyDown={e=>{if(e.key==="Enter"&&aiIn.trim()){runAI(aiIn);setAiIn("");}}}/>
-              <button className="aisend" disabled={!aiIn.trim()||aiLoad}
-                onClick={()=>{runAI(aiIn);setAiIn("");}}>←</button>
+              <button className="aisend" disabled={!aiIn.trim()||aiLoad} onClick={()=>{runAI(aiIn);setAiIn("");}}>←</button>
             </div>
           )}
         </aside>
 
-        {/* ── PLAYER BAR ── */}
+        {/* PLAYER BAR */}
         <footer className="player">
           <div className="pbk">
             <div className="pcover" style={{background:(book?.color||"#1a6b4a")+"33"}}>{book?.icon||"📗"}</div>
             <div>
-              <div className="ptitle">{book?.title||"—"}</div>
-              <div className="pch">{book?`الفصل ${ch+1}: ${book.chapters[ch]}`:"—"}</div>
+              <div className="ptitle">{book?.title||"اختر كتاباً"}</div>
+              <div className="pch">{book?`ص ${pageIdx+1}/${totalPages}`:"—"}</div>
             </div>
           </div>
-
           <div className="pctrls">
-            <button className="ctrl" onClick={()=>setCh(c=>Math.max(0,c-1))}><Ic n="prev" s={13}/></button>
+            <button className="ctrl" onClick={goPrevPage}><Ic n="prev" s={13}/></button>
             <button className="ctrl" onClick={()=>setProg(p=>Math.max(0,p-3))}><Ic n="rwd" s={14}/></button>
-            <button className={`pp${ttsOn?" spk":""}`} onClick={()=>{ if(ttsOn) stopTTS(); else { setView("reader"); doTTS(); } }}>
+            <button className={`pp${ttsOn?" spk":""}`} onClick={()=>{ if(ttsOn) stopTTS(); else { setView("reader"); setTimeout(doTTS,100); } }}>
               <Ic n={ttsOn?"pause":"play"} s={15}/>
             </button>
             <button className="ctrl" onClick={()=>setProg(p=>Math.min(100,p+3))}><Ic n="fwd" s={14}/></button>
-            <button className="ctrl" onClick={()=>setCh(c=>Math.min((book?.chapters.length||1)-1,c+1))}><Ic n="next" s={13}/></button>
+            <button className="ctrl" onClick={goNextPage}><Ic n="next" s={13}/></button>
           </div>
-
           <div className="pright">
             <span className="tlbl">{fmtT(prog)}</span>
             <div className="ptrack" onClick={e=>{const r=e.currentTarget.getBoundingClientRect();setProg(Math.max(0,Math.min(100,((e.clientX-r.left)/r.width)*100)));}}>
-              <div className="pfill" style={{width:`${prog}%`}}/>
+              <div className="pfill" style={{width:`${book?.progress||0}%`}}/>
             </div>
-            <span className="tlbl">42:10</span>
+            <span className="tlbl">{book?`${book.pages||0} ص`:""}</span>
           </div>
-
           <div className="spdg">
             <button className="spdb" onClick={()=>{setSpeed(s=>Math.max(0.5,Math.round((s-.25)*4)/4));if(ttsOn)stopTTS();}}>−</button>
             <span className="spdv">{speed.toFixed(2).replace(/\.?0+$/,"")}×</span>
             <button className="spdb" onClick={()=>{setSpeed(s=>Math.min(4,Math.round((s+.25)*4)/4));if(ttsOn)stopTTS();}}>+</button>
           </div>
-
           <div className="vind" onClick={()=>{setAiTab("voices");setView("reader");}}>
             <Ic n="mic" s={12}/>
             <span style={{fontSize:11,color:"var(--t2)"}}>{voice.label}</span>
           </div>
         </footer>
 
-        {/* ── ADD BOOK MODAL ── */}
+        {/* ADD BOOK MODAL */}
         {showAdd&&(
           <div className="mbg" onClick={e=>e.target===e.currentTarget&&setShowAdd(false)}>
             <div className="modal fi">
@@ -973,58 +1165,105 @@ function App() {
                 <button className="mcls" onClick={()=>setShowAdd(false)}><Ic n="x" s={15}/></button>
               </div>
               <div className="srctabs">
-                {[{id:"pdf",l:"PDF / ملف",i:"upload"},{id:"url",l:"رابط ويب",i:"link"},
+                {[{id:"pdf",l:"PDF / TXT",i:"upload"},{id:"url",l:"رابط ويب",i:"link"},
                   {id:"text",l:"لصق نص",i:"text"},{id:"ocr",l:"مسح ورقي",i:"camera"}]
-                  .map(t=><button key={t.id} className={`srctab${addTab===t.id?" on":""}`} onClick={()=>setAddTab(t.id)}>
+                  .map(t=><button key={t.id} className={`srctab${addTab===t.id?" on":""}`} onClick={()=>{setAddTab(t.id);setAddErr("");}}>
                     <Ic n={t.i} s={15}/>{t.l}
                   </button>)}
               </div>
               <div className="mbody">
-                {addTab==="pdf"&&<div className="dzone">
-                  <div style={{fontSize:24,color:"var(--t3)",marginBottom:7}}><Ic n="upload" s={24}/></div>
-                  <div style={{fontSize:13,color:"var(--t2)",fontWeight:500}}>اسحب ملفك هنا أو انقر للاختيار</div>
-                  <div style={{fontSize:11,color:"var(--t3)",marginTop:3}}>PDF · EPUB · DOCX · TXT</div>
-                </div>}
-                {addTab==="url"&&<>
-                  <input className="mi" placeholder="الصق رابط الكتاب أو المقال..." value={urlIn} onChange={e=>setUrlIn(e.target.value)}/>
-                  <div style={{fontSize:11,color:"var(--t3)"}}>مثال: https://shamela.ws/book/123</div>
-                </>}
-                {addTab==="text"&&<textarea className="mi" rows={6} placeholder="الصق النص العربي هنا..." value={txtIn} onChange={e=>setTxtIn(e.target.value)}/>}
-                {addTab==="ocr"&&<div style={{textAlign:"center",padding:"8px 0"}}>
-                  <div style={{fontSize:28,marginBottom:9}}>📷</div>
-                  <div style={{fontSize:13,color:"var(--t2)",marginBottom:12}}>ارفع صورة كتاب ورقي — الذكاء الاصطناعي يستخرج النص تلقائياً</div>
-                  <button className="msub" style={{background:"var(--purple)"}} onClick={()=>{setShowAdd(false);setAiTab("ocr");setView("reader");}}>انتقل إلى المسح الضوئي</button>
-                </div>}
-                {addTab!=="ocr"&&(
-                  <button className="msub" onClick={()=>{
-                    const nb={id:books.length+1,
-                      title:addTab==="url"?(urlIn||"كتاب من الويب"):addTab==="text"?"نص مُلصق":"كتاب مرفوع",
-                      author:"—",type:"متنوع",progress:0,color:"#2a3a2a",
-                      icon:addTab==="url"?"🌐":addTab==="text"?"📝":"📄",
-                      chapters:["الفصل الأول"],summary:"جارٍ معالجة الكتاب...",
-                      excerpt:txtIn||urlIn||"محتوى الكتاب"};
-                    setBooks(b=>[...b,nb]);setShowAdd(false);setUrlIn("");setTxtIn("");
-                    showT("✓ أُضيف الكتاب إلى مكتبتك");
-                  }}>إضافة إلى المكتبة</button>
+                <input className="mi" placeholder="اسم الكتاب (اختياري)" value={addTitle} onChange={e=>setAddTitle(e.target.value)}/>
+
+                {addTab==="pdf"&&(
+                  <div className="dzone" ref={pdfRef}
+                    onClick={()=>{ const inp=document.createElement('input'); inp.type='file'; inp.accept='.pdf,.txt,.epub'; inp.onchange=e=>handlePDFFile(e.target.files[0]); inp.click(); }}
+                    onDragOver={e=>{e.preventDefault();pdfRef.current?.classList.add("drag");}}
+                    onDragLeave={()=>pdfRef.current?.classList.remove("drag")}
+                    onDrop={e=>{e.preventDefault();pdfRef.current?.classList.remove("drag");handlePDFFile(e.dataTransfer.files[0]);}}>
+                    <div style={{fontSize:28,marginBottom:8}}><Ic n="upload" s={28}/></div>
+                    <div style={{fontSize:13,color:"var(--t2)",fontWeight:500}}>اسحب الملف هنا أو انقر للاختيار</div>
+                    <div style={{fontSize:11,color:"var(--t3)",marginTop:4}}>PDF · TXT — يُستخرج النص تلقائياً</div>
+                  </div>
                 )}
+
+                {addTab==="url"&&<>
+                  <input className="mi" placeholder="https://..." value={urlIn} onChange={e=>setUrlIn(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleURL()}/>
+                  <div className="minfo">
+                    يجلب النص من الرابط مباشرة. يعمل مع معظم المواقع العربية.<br/>
+                    مثال: مقالات ويكيبيديا، الشاملة، المكتبة الوقفية
+                  </div>
+                  <button className="msub" disabled={!urlIn.trim()} onClick={handleURL}>
+                    جلب المحتوى من الرابط
+                  </button>
+                </>}
+
+                {addTab==="text"&&<>
+                  <textarea className="mi" rows={7} placeholder="الصق النص العربي هنا مباشرة..." value={txtIn} onChange={e=>setTxtIn(e.target.value)}/>
+                  <button className="msub" disabled={!txtIn.trim()} onClick={()=>{
+                    const nb={id:Date.now(),title:addTitle||"نص مُلصق",author:"—",type:"متنوع",progress:0,color:"#2a2a3a",icon:"📝",
+                      chapters:["النص الكامل"],summary:"نص مُلصق يدوياً.",excerpt:txtIn,pages:Math.ceil(txtIn.split(/\s+/).length/300)};
+                    setBooks(b=>[...b,nb]);setShowAdd(false);setTxtIn("");setAddTitle("");
+                    openBook(nb); showT("✓ تم إضافة النص");
+                  }}>إضافة النص إلى المكتبة</button>
+                </>}
+
+                {addTab==="ocr"&&(
+                  <div style={{textAlign:"center",padding:"8px 0"}}>
+                    <div style={{fontSize:32,marginBottom:10}}>📷</div>
+                    <div style={{fontSize:13,color:"var(--t2)",marginBottom:14}}>ارفع صورة كتاب ورقي — Claude يستخرج النص تلقائياً</div>
+                    <button className="msub" style={{background:"var(--purple)"}} onClick={()=>{setShowAdd(false);setAiTab("ocr");setView("reader");}}>
+                      انتقل إلى المسح الضوئي
+                    </button>
+                  </div>
+                )}
+
+                {addErr&&<div className="merr">⚠ {addErr}</div>}
               </div>
             </div>
           </div>
         )}
 
-        {/* ── API KEY MODAL ── */}
+        {/* RESUME DIALOG — نافذة استئناف القراءة */}
+        {resumeDlg&&(
+          <div className="mbg" onClick={e=>e.target===e.currentTarget&&setResumeDlg(null)}>
+            <div className="rdlg fi">
+              <div className="rdlg-cover" style={{background:(resumeDlg.book.color||"#1a6b4a")+"66"}}>
+                {resumeDlg.book.icon}
+              </div>
+              <div className="rdlg-body">
+                <div className="rdlg-title">{resumeDlg.book.title}</div>
+                <div className="rdlg-sub">
+                  آخر موضع: الفصل {(resumeDlg.saved.ch||0)+1} · صفحة {(resumeDlg.saved.page||0)+1}<br/>
+                  التقدم: {resumeDlg.saved.prog||0}% من الكتاب
+                </div>
+                <div className="rdlg-prog">
+                  <div className="rdlg-prog-fill" style={{width:`${resumeDlg.saved.prog||0}%`}}/>
+                </div>
+                <div className="rdlg-btns">
+                  <button className="rdlg-btn-main" onClick={()=>startBook(resumeDlg.book, resumeDlg.saved.ch||0, resumeDlg.saved.page||0, resumeDlg.saved.prog||0)}>
+                    ▶ استمر من حيث توقفت
+                  </button>
+                  <button className="rdlg-btn-sec" onClick={()=>{ LS.del(`qaree_prog_${resumeDlg.book.id}`); startBook(resumeDlg.book,0,0,0); }}>
+                    ↺ ابدأ من البداية
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+
         {showKey&&(
           <div className="mbg" onClick={e=>e.target===e.currentTarget&&setShowKey(false)}>
             <div className="kmodal fi">
               <div className="mhead">
-                <span className="mtitle" style={{display:"flex",alignItems:"center",gap:8}}>
-                  <Ic n="key" s={15}/> مفتاح Anthropic API
-                </span>
+                <span className="mtitle" style={{display:"flex",alignItems:"center",gap:8}}><Ic n="key" s={15}/> مفتاح Anthropic API</span>
                 <button className="mcls" onClick={()=>setShowKey(false)}><Ic n="x" s={15}/></button>
               </div>
               <div className="mbody">
                 <div className="kinfo">
-                  يُستخدم للمساعد الذكي وميزة OCR. يبقى في ذاكرة المتصفح فقط ولا يُخزَّن.<br/>
+                  يُستخدم للمساعد الذكي وميزة OCR.<br/>
+                  <strong style={{color:"var(--a3)"}}>✓ يُحفظ تلقائياً</strong> في المتصفح — لن تحتاج إدخاله مجدداً.<br/>
                   احصل على مفتاحك من: <span style={{color:"var(--a3)"}}>console.anthropic.com</span>
                 </div>
                 <div className="krow">
@@ -1035,10 +1274,9 @@ function App() {
                   <button className="ksave" onClick={saveKey}>حفظ</button>
                 </div>
                 {hasKey&&(
-                  <div style={{padding:"8px 11px",background:"rgba(46,168,110,.09)",border:"1px solid var(--a)",
-                    borderRadius:8,fontSize:12,color:"var(--a3)",display:"flex",alignItems:"center",gap:6}}>
-                    <Ic n="check" s={13}/> مفتاح API نشط
-                    <button onClick={()=>{setKey("");setHasKey(false);setKeyIn("");setShowKey(false);showT("تم حذف المفتاح");}}
+                  <div style={{padding:"8px 11px",background:"rgba(46,168,110,.09)",border:"1px solid var(--a)",borderRadius:8,fontSize:12,color:"var(--a3)",display:"flex",alignItems:"center",gap:6}}>
+                    <Ic n="check" s={13}/> مفتاح API نشط ومحفوظ
+                    <button onClick={()=>{clearApiKey();setHasKey(false);setKeyIn("");setShowKey(false);showT("تم حذف المفتاح");}}
                       style={{marginRight:"auto",fontSize:11,background:"none",border:"none",color:"var(--red)",cursor:"pointer"}}>حذف</button>
                   </div>
                 )}
@@ -1052,14 +1290,14 @@ function App() {
   );
 }
 
-// ── BookCard component ────────────────────────────────────────────────────────
-function Bcard({b, sel, onClick}) {
+function Bcard({b, sel, onClick, onDel}) {
   return (
     <div className={`bc${sel?" sel":""}`} onClick={onClick}>
       <div className="bcover" style={{background:(b.color||"#1a6b4a")+"44"}}>
         {b.icon}
         <div className="bpct">{b.progress}%</div>
         <div className="bbar"><div className="bfill" style={{width:`${b.progress}%`}}/></div>
+        <button className="bdel" onClick={onDel}><Ic n="trash" s={11}/></button>
       </div>
       <div className="bbody">
         <div className="btitle">{b.title}</div>
@@ -1070,9 +1308,13 @@ function Bcard({b, sel, onClick}) {
   );
 }
 
-// ── Render ────────────────────────────────────────────────────────────────────
-const root = ReactDOM.createRoot(document.getElementById('root'));
+// Render
+const container = document.getElementById('root');
+const root = ReactDOM.createRoot(container);
 root.render(<App/>);
+
+// Hide loading screen
+document.getElementById('loading').style.display='none';
   </script>
 </body>
 </html>
