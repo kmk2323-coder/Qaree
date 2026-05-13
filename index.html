@@ -94,22 +94,116 @@ async function callClaude(system, userMsg, onChunk, imageB64=null) {
   return full;
 }
 
-// ── PDF Reader ────────────────────────────────────────────────────────────────
+// ── PDF Text Extractor (محسَّن للعربية) ──────────────────────────────────────
 async function extractPDFText(file) {
   const buffer = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({data: buffer}).promise;
+  const pdf = await pdfjsLib.getDocument({
+    data: buffer,
+    // تحسين: تعطيل ضغط النص للحصول على مواضع دقيقة
+    disableFontFace: false,
+    useSystemFonts: true,
+  }).promise;
+
   let fullText = "";
   const chapters = [];
-  for (let i=1; i<=pdf.numPages; i++) {
+  let totalArabicChars = 0;
+  let totalChars = 0;
+
+  for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const pageText = content.items.map(item=>item.str).join(" ").trim();
-    if (pageText) {
+    const content = await page.getTextContent({ includeMarkedContent: false });
+    const viewport = page.getViewport({ scale: 1 });
+
+    // ── جمع العناصر مع مواضعها ─────────────────────────────────────────────
+    const items = content.items
+      .filter(item => item.str && item.str.trim())
+      .map(item => ({
+        str: item.str,
+        x: item.transform[4],
+        y: viewport.height - item.transform[5], // عكس محور Y
+        width: item.width,
+        height: item.height,
+        fontSize: Math.abs(item.transform[3]),
+      }));
+
+    if (!items.length) {
+      if (i === 1 || i % 20 === 0) chapters.push(`الصفحة ${i}`);
+      continue;
+    }
+
+    // ── تجميع في أسطر بناءً على موضع Y ──────────────────────────────────────
+    const lineThreshold = 5; // px
+    const lines = [];
+    let currentLine = [items[0]];
+
+    for (let j = 1; j < items.length; j++) {
+      const prev = items[j-1];
+      const curr = items[j];
+      if (Math.abs(curr.y - prev.y) <= lineThreshold) {
+        currentLine.push(curr);
+      } else {
+        lines.push(currentLine);
+        currentLine = [curr];
+      }
+    }
+    lines.push(currentLine);
+
+    // ── ترتيب كل سطر من اليمين لليسار (للعربية) ─────────────────────────────
+    let pageText = lines.map(line => {
+      // ترتيب من اليمين لليسار (x أكبر = يمين الصفحة)
+      const sorted = line.sort((a, b) => b.x - a.x);
+      return sorted.map(item => item.str).join(" ");
+    }).join("\n");
+
+    // ── تنظيف النص العربي ─────────────────────────────────────────────────────
+    pageText = cleanArabicText(pageText);
+
+    // إحصاء العربية لتحديد هل PDF نصي أم مصوَّر
+    const arabic = (pageText.match(/[\u0600-\u06FF]/g) || []).length;
+    totalArabicChars += arabic;
+    totalChars += pageText.replace(/\s/g, "").length;
+
+    if (pageText.trim()) {
       fullText += pageText + "\n\n";
-      if (i===1 || i%20===0) chapters.push(`الصفحة ${i}`);
+      // استخراج الفصول من العناوين (نص كبير في أعلى الصفحة)
+      const headings = items.filter(item =>
+        item.fontSize > 14 && item.y < viewport.height * 0.25
+      );
+      if (headings.length && i % 10 === 1) {
+        const headText = headings.map(h => h.str).join(" ").trim();
+        if (headText) chapters.push(headText.slice(0, 40));
+        else chapters.push(`الصفحة ${i}`);
+      } else if (i === 1 || i % 20 === 0) {
+        chapters.push(`الصفحة ${i}`);
+      }
     }
   }
-  return { text: fullText.trim(), pages: pdf.numPages, chapters };
+
+  // نسبة العربية — إذا أقل من 15% فالـ PDF على الأرجح مصوَّر
+  const arabicRatio = totalChars > 0 ? totalArabicChars / totalChars : 0;
+
+  return {
+    text: fullText.trim(),
+    pages: pdf.numPages,
+    chapters: chapters.length ? chapters : ["الفصل الأول"],
+    isScanned: arabicRatio < 0.15 || fullText.trim().length < 100,
+    arabicRatio: Math.round(arabicRatio * 100),
+    pdfDoc: await pdfjsLib.getDocument({data: await file.arrayBuffer()}).promise,
+  };
+}
+
+// ── تنظيف النص العربي ─────────────────────────────────────────────────────────
+function cleanArabicText(text) {
+  return text
+    // دمج الحروف المنفصلة (مثل: ك ت ا ب → كتاب)
+    .replace(/(?<=[\u0600-\u06FF])\s(?=[\u0600-\u06FF\u064B-\u065F])/g, "")
+    // إزالة المسافات الزائدة بين الكلمات
+    .replace(/\s{2,}/g, " ")
+    // إزالة الأحرف الغريبة التي تظهر أحياناً
+    .replace(/[^\u0600-\u06FF\u064B-\u0652\u0660-\u0669\u200C\u200D\w\s\n،؛؟!().،:«»""''٪٠-٩%-]/g, " ")
+    // تنظيف المسافات في بداية ونهاية كل سطر
+    .split("\n").map(l => l.trim()).filter(l => l.length > 1).join("\n")
+    .trim();
 }
 
 // ── URL Proxy (via allorigins) ────────────────────────────────────────────────
@@ -704,49 +798,36 @@ function App() {
       // ── PDF ───────────────────────────────────────────────────────────────
       else if (isPDF && window.pdfjsLib) {
         setLoadMsg("جارٍ قراءة الملف...");
-        const buffer = await file.arrayBuffer();
-        const pdfDoc = await pdfjsLib.getDocument({data: buffer}).promise;
-        pages = pdfDoc.numPages;
+        const result = await extractPDFText(file);
+        pages = result.pages;
 
-        // أولاً: حاول استخراج النص النصي
-        setLoadMsg(`جارٍ استخراج النص — ${pages} صفحة...`);
-        let extractedText = "";
-        const chaptersList = [];
-        for (let i=1; i<=pages; i++) {
-          const page = await pdfDoc.getPage(i);
-          const content = await page.getTextContent();
-          const pt = content.items.map(item=>item.str).join(" ").trim();
-          if (pt) extractedText += pt + "\n\n";
-          if (i===1 || i%20===0) chaptersList.push(`الصفحة ${i}`);
-        }
-
-        const arabicChars = (extractedText.match(/[\u0600-\u06FF]/g)||[]).length;
-        const totalChars = extractedText.replace(/\s/g,"").length;
-
-        // إذا النص فارغ أو أقل من 20% عربي → OCR بالذكاء الاصطناعي
-        if (!extractedText.trim() || (totalChars>0 && arabicChars/totalChars < 0.2)) {
+        if (!result.isScanned && result.text.length >= 100) {
+          // ── PDF نصي — نص جيد ─────────────────────────────────────────────
+          setLoadMsg(`✓ استُخرج النص (${result.arabicRatio}% عربي)`);
+          text = result.text;
+          chapters = result.chapters;
+          usedOCR = false;
+        } else {
+          // ── PDF مصوَّر — OCR بالذكاء الاصطناعي ──────────────────────────
           if (!hasKey) {
-            setAddErr("هذا الـ PDF يحتوي على صور وليس نصاً — يحتاج مفتاح API لاستخراج النص عبر OCR");
+            setAddErr(`هذا الـ PDF يحتوي على صور (${result.arabicRatio}% نص). يحتاج مفتاح API لـ OCR — أدخله من الشريط العلوي.`);
             setLoading(false); return;
           }
-          setLoadMsg(`🔍 PDF مصوَّر — جارٍ OCR بالذكاء الاصطناعي (${Math.min(pages,5)} صفحة)...`);
-          const maxPages = Math.min(pages, 5); // حد أقصى 5 صفحات لتوفير التكلفة
+          const maxPages = Math.min(pages, 5);
+          setLoadMsg(`📷 PDF مصوَّر — OCR صفحة 1 من ${maxPages}...`);
           let ocrText = "";
-          for (let i=1; i<=maxPages; i++) {
-            setLoadMsg(`🔍 OCR: صفحة ${i} من ${maxPages}...`);
+          for (let i = 1; i <= maxPages; i++) {
+            setLoadMsg(`📷 OCR: صفحة ${i} من ${maxPages}...`);
             try {
-              const b64 = await pdfPageToBase64(pdfDoc, i);
+              const b64 = await pdfPageToBase64(result.pdfDoc, i);
               const pageText = await ocrViaClaudeBase64(b64);
-              ocrText += pageText + "\n\n";
+              ocrText += cleanArabicText(pageText) + "\n\n";
             } catch(e) { console.warn("OCR page error:", e); }
           }
-          if (pages > 5) ocrText += `\n\n[ملاحظة: تم OCR أول 5 صفحات من أصل ${pages}]`;
+          if (pages > 5) ocrText += `\n\n[تم معالجة أول 5 صفحات من أصل ${pages}]`;
           text = ocrText.trim();
           chapters = Array.from({length:Math.min(pages,5)},(_,i)=>`الصفحة ${i+1}`);
           usedOCR = true;
-        } else {
-          text = extractedText.trim();
-          chapters = chaptersList.length ? chaptersList : ["الفصل الأول"];
         }
       }
 
