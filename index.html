@@ -908,39 +908,147 @@ function App() {
     setLoading(false);
   };
 
-  // ── TTS ─────────────────────────────────────────────────────────────────────
-  const doTTS=()=>{
-    if(ttsOn){ if(tts.paused) tts.resume(); else tts.pause(); return; }
-    const text=currentPageText; if(!text) return;
-    const words=text.split(" ");
-    const map=[]; let c=0;
-    words.forEach(w=>{ map.push(c); c+=w.length+1; });
-    setTtsOn(true); setHiIdx(0);
-    const ok=tts.speak(text, voice, speed,
-      (ci)=>{ const wi=map.reduce((p,v,i)=>v<=ci?i:p,0); setHiIdx(wi); },
-      ()=>{
-        setTtsOn(false); setHiIdx(-1);
-        // Auto advance to next page
-        if (pageIdx < totalPages-1) {
-          const np=pageIdx+1;
-          const newProg=Math.min(99,Math.round(((ch*totalPages+np)/((book?.chapters?.length||1)*totalPages))*100));
-          setTimeout(()=>{ setPageIdx(np); if(book) saveProgress(book.id,ch,np,newProg); }, 600);
+  // ── TTS — كل شيء في refs لتجنب stale closure نهائياً ─────────────────────
+  const ttsOnRef       = useRef(false);
+  const hiIdxRef       = useRef(-1);
+  const charOffsetRef  = useRef(0);
+  const currentTextRef = useRef("");
+  const voiceRef       = useRef(voice);
+  const speedRef       = useRef(speed);
+  const pageIdxRef     = useRef(pageIdx);
+  const chRef          = useRef(ch);
+  const totalPagesRef  = useRef(totalPages);
+  const bookRef        = useRef(book);
+
+  // مزامنة الـ refs مع الـ state
+  useEffect(()=>{ voiceRef.current=voice; }, [voice]);
+  useEffect(()=>{ speedRef.current=speed; }, [speed]);
+  useEffect(()=>{ pageIdxRef.current=pageIdx; }, [pageIdx]);
+  useEffect(()=>{ chRef.current=ch; }, [ch]);
+  useEffect(()=>{ totalPagesRef.current=totalPages; }, [totalPages]);
+  useEffect(()=>{ bookRef.current=book; }, [book]);
+
+  const buildWordMap = (text) => {
+    const words = text.split(" ");
+    const map = []; let c = 0;
+    words.forEach(w => { map.push(c); c += w.length + 1; });
+    return { words, map };
+  };
+
+  const _speak = (text, fromChar) => {
+    const slice = fromChar > 0 ? text.slice(fromChar) : text;
+    if (!slice.trim()) return;
+    const { map } = buildWordMap(text);
+
+    tts.speak(
+      slice,
+      voiceRef.current,
+      speedRef.current,
+      // onWord — يحدّث الـ ref والـ state
+      (ci) => {
+        const abs = fromChar + ci;
+        charOffsetRef.current = abs;
+        const wi = map.reduce((p,v,i) => v<=abs ? i : p, 0);
+        hiIdxRef.current = wi;
+        setHiIdx(wi); // لتحديث الواجهة فقط
+      },
+      // onEnd
+      () => {
+        ttsOnRef.current = false;
+        charOffsetRef.current = 0;
+        const pi = pageIdxRef.current;
+        const tp = totalPagesRef.current;
+        const ci = chRef.current;
+        const bk = bookRef.current;
+        const chLen = bk?.chapters?.length || 1;
+
+        if (pi < tp - 1) {
+          const np = pi + 1;
+          const prog = Math.min(99, Math.round(((ci*tp+np)/(chLen*tp))*100));
+          setPageIdx(np);
+          if (bk) saveProgress(bk.id, ci, np, prog);
           showT("▶ الصفحة التالية");
-        } else if (ch < (book?.chapters?.length||1)-1) {
-          const nc=ch+1;
-          const newProg=Math.min(99,Math.round((nc/(book?.chapters?.length||1))*100));
-          setTimeout(()=>{ setCh(nc); setPageIdx(0); if(book) saveProgress(book.id,nc,0,newProg); }, 600);
+          // الاستمرار التلقائي بعد تحديث الصفحة
+          setTimeout(() => {
+            ttsOnRef.current = true;
+            setTtsOn(s => !s); // toggle لإجبار React على re-render جديد
+          }, 350);
+        } else if (ci < chLen - 1) {
+          const nc = ci + 1;
+          const prog = Math.min(99, Math.round((nc/chLen)*100));
+          setCh(nc); setPageIdx(0);
+          if (bk) saveProgress(bk.id, nc, 0, prog);
           showT("▶ الفصل التالي");
+          setTimeout(() => {
+            ttsOnRef.current = true;
+            setTtsOn(s => !s);
+          }, 350);
         } else {
-          // أكمل الكتاب
-          if(book) saveProgress(book.id, ch, pageIdx, 100);
+          setHiIdx(-1);
+          setTtsOn(false);
+          if (bk) saveProgress(bk.id, ci, pi, 100);
           showT("🎉 أكملت هذا الكتاب!");
         }
       }
     );
-    if(!ok) showT("المتصفح لا يدعم الصوت العربي — جرّب Chrome");
   };
-  const stopTTS=()=>{ tts.stop(); setTtsOn(false); setHiIdx(-1); };
+
+  // Effect واحد فقط — يُشغَّل عند كل تغيير في ttsOn أو الصفحة أو الفصل
+  const ttsRunKey = `${ttsOn}_${pageIdx}_${ch}`;
+  useEffect(() => {
+    if (!ttsOnRef.current) return;
+    const text = currentPageText;
+    currentTextRef.current = text;
+    if (!text) { setTtsOn(false); ttsOnRef.current=false; return; }
+    _speak(text, charOffsetRef.current);
+    return () => { tts.stop(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ttsRunKey]);
+
+  const doTTS = () => {
+    if (ttsOnRef.current) {
+      // إيقاف مؤقت — لا نمسح hiIdx ولا charOffset
+      tts.stop();
+      ttsOnRef.current = false;
+      setTtsOn(false);
+      return;
+    }
+    // استئناف / بداية جديدة
+    if (hiIdxRef.current < 0) charOffsetRef.current = 0;
+    ttsOnRef.current = true;
+    setTtsOn(true);
+  };
+
+  const stopTTS = () => {
+    tts.stop();
+    ttsOnRef.current = false;
+    setTtsOn(false);
+    setHiIdx(-1);
+    hiIdxRef.current = -1;
+    charOffsetRef.current = 0;
+  };
+
+  const seekToWord = (wordIdx) => {
+    const text = currentPageText;
+    const { map } = buildWordMap(text);
+    const newChar = map[wordIdx] || 0;
+    charOffsetRef.current = newChar;
+    hiIdxRef.current = wordIdx;
+    setHiIdx(wordIdx);
+    if (ttsOnRef.current) {
+      tts.stop();
+      setTimeout(() => _speak(text, newChar), 80);
+    }
+  };
+
+  const skip = (seconds) => {
+    const text = currentPageText;
+    if (!text) return;
+    const { words } = buildWordMap(text);
+    const wordsToSkip = Math.round((Math.abs(seconds) * speedRef.current) / 0.4) * Math.sign(seconds);
+    const newIdx = Math.max(0, Math.min(words.length-1, hiIdxRef.current + wordsToSkip));
+    seekToWord(newIdx);
+  };
 
   const testVoice=(cfg)=>{
     if(testV===cfg.id){tts.stop();setTestV(null);return;}
@@ -950,7 +1058,7 @@ function App() {
 
   // ── Page navigation ──────────────────────────────────────────────────────────
   const goNextPage=()=>{
-    stopTTS();
+    tts.stop(); setTtsOn(false); setHiIdx(-1); setCharOffset(0);
     if(pageIdx<totalPages-1){
       const np=pageIdx+1;
       setPageIdx(np);
@@ -964,7 +1072,7 @@ function App() {
     }
   };
   const goPrevPage=()=>{
-    stopTTS();
+    tts.stop(); setTtsOn(false); setHiIdx(-1); setCharOffset(0);
     if(pageIdx>0){
       const np=pageIdx-1;
       setPageIdx(np);
@@ -1123,9 +1231,14 @@ function App() {
                   {currentPageText.split(" ").map((word,i)=>{
                     const clean=word.replace(/[،.!؟:؛]/g,"");
                     const def=DICT[clean];
-                    const isHi=ttsOn&&hiIdx===i;
+                    // أضئ الكلمة سواء كان الصوت شغّالاً أو موقوفاً مؤقتاً
+                    const isHi = hiIdx===i;
                     return def?(
-                      <span key={i} style={{position:"relative",display:"inline"}} onMouseEnter={()=>setHovW(clean)} onMouseLeave={()=>setHovW(null)}>
+                      <span key={i}
+                        style={{position:"relative",display:"inline",cursor:"pointer"}}
+                        onMouseEnter={()=>setHovW(clean)}
+                        onMouseLeave={()=>setHovW(null)}
+                        onClick={()=>seekToWord(i)}>
                         <span className={`wh ttsw${isHi?" hi":""}`}>{word} </span>
                         {hovW===clean&&(
                           <span className="wtt">
@@ -1135,7 +1248,12 @@ function App() {
                         )}
                       </span>
                     ):(
-                      <span key={i} className={`ttsw${isHi?" hi":""}`}>{word} </span>
+                      <span
+                        key={i}
+                        className={`ttsw${isHi?" hi":""}`}
+                        onClick={()=>seekToWord(i)}
+                        style={{cursor:"pointer"}}
+                      >{word} </span>
                     );
                   })}
                 </div>
@@ -1317,8 +1435,8 @@ function App() {
           </div>
 
           <div className="pctrls">
-            <button className="ctrl" title="الفصل السابق" onClick={goPrevPage}><Ic n="prev" s={14}/></button>
-            <button className="ctrl" title="30 ثانية للخلف" onClick={()=>setProg(p=>Math.max(0,p-3))}><Ic n="rwd" s={15}/></button>
+            <button className="ctrl" title="الصفحة السابقة" onClick={goPrevPage}><Ic n="prev" s={14}/></button>
+            <button className="ctrl" title="30 ثانية للخلف" onClick={()=>skip(-30)}><Ic n="rwd" s={15}/></button>
 
             {/* زر التشغيل الرئيسي — ثابت وواضح دائماً */}
             <div className="pp-label">
@@ -1333,8 +1451,8 @@ function App() {
               </span>
             </div>
 
-            <button className="ctrl" title="30 ثانية للأمام" onClick={()=>setProg(p=>Math.min(100,p+3))}><Ic n="fwd" s={15}/></button>
-            <button className="ctrl" title="الفصل التالي" onClick={goNextPage}><Ic n="next" s={14}/></button>
+            <button className="ctrl" title="30 ثانية للأمام" onClick={()=>skip(30)}><Ic n="fwd" s={15}/></button>
+            <button className="ctrl" title="الصفحة التالية" onClick={goNextPage}><Ic n="next" s={14}/></button>
           </div>
 
           <div className="pright">
